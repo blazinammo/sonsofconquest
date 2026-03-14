@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Age of Realms – Multiplayer RTS</title>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600;700&family=Crimson+Text:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#000;overflow:hidden;font-family:'Crimson Text',serif;}
+#canvas{display:block;width:100vw;height:100vh;position:absolute;top:0;left:0;}
+
+/* ── Loading ── */
+#loading{position:fixed;inset:0;background:radial-gradient(ellipse at center,#1a0e04 0%,#050200 100%);
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;z-index:2000;}
+#loading-crest{font-size:72px;animation:pulse 2s infinite;}
+#loading h1{color:#d4a84b;font-family:'Cinzel',serif;font-size:42px;letter-spacing:6px;text-shadow:0 0 40px rgba(212,168,75,0.6);}
+#loading-sub{color:#7a5c28;font-family:'Cinzel',serif;font-size:13px;letter-spacing:3px;}
+#loading-bar-wrap{width:320px;height:6px;background:rgba(212,168,75,0.15);border-radius:3px;border:1px solid rgba(212,168,75,0.3);overflow:hidden;}
+#loading-fill{height:100%;background:linear-gradient(90deg,#7a5c28,#d4a84b,#f0c060);width:0%;transition:width 0.4s;border-radius:3px;}
+#loading-tip{color:#5a4020;font-size:12px;font-style:italic;max-width:300px;text-align:center;}
+@keyframes pulse{0%,100%{transform:scale(1);}50%{transform:scale(1.08);}}
+
+/* ── Pre-game Screens ── */
+.screen{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:1500;background:radial-gradient(ellipse at center,#1a0e04,#050200);}
+.screen.hidden{display:none!important;}
+.cinzel{font-family:'Cinzel',serif;}
+h1.game-title{font-family:'Cinzel',serif;font-size:clamp(2rem,5vw,4rem);font-weight:700;color:#d4a84b;text-shadow:0 0 40px rgba(212,168,75,0.6);letter-spacing:0.15em;text-align:center;}
+.gold-input{padding:12px 18px;background:rgba(20,12,3,0.9);border:1px solid #6b4f10;border-radius:3px;color:#f0d06a;font-family:'Cinzel',serif;font-size:0.9rem;letter-spacing:0.1em;outline:none;width:100%;text-align:center;transition:border-color 0.2s;}
+.gold-input::placeholder{color:rgba(212,168,75,0.3);}
+.gold-input:focus{border-color:#d4a84b;box-shadow:0 0 16px rgba(212,168,75,0.2);}
+.btn-gold{padding:12px 24px;background:linear-gradient(135deg,#3a2800,#7a5c0a 40%,#c9a227 70%,#7a5c0a 90%,#3a2800);border:1px solid #d4a84b;border-radius:3px;color:#fff8e0;font-family:'Cinzel',serif;font-size:0.85rem;font-weight:600;letter-spacing:0.2em;cursor:pointer;width:100%;transition:all 0.2s;text-transform:uppercase;}
+.btn-gold:hover{box-shadow:0 0 20px rgba(212,168,75,0.4);transform:translateY(-1px);}
+.btn-sm{padding:7px 14px;background:rgba(212,168,75,0.08);border:1px solid rgba(107,79,16,0.5);border-radius:3px;color:#d4a84b;font-family:'Cinzel',serif;font-size:0.72rem;cursor:pointer;letter-spacing:0.1em;transition:all 0.15s;text-transform:uppercase;}
+.btn-sm:hover{background:rgba(212,168,75,0.18);border-color:#d4a84b;}
+.panel{background:rgba(8,5,2,0.95);border:1px solid rgba(107,79,16,0.6);border-radius:4px;padding:18px;}
+.panel h3{font-family:'Cinzel',serif;font-size:0.8rem;letter-spacing:0.25em;color:#d4a84b;text-transform:uppercase;margin-bottom:14px;padding-bottom:8px;border-bottom:1px solid rgba(107,79,16,0.4);}
+.lobby-item{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:rgba(212,168,75,0.04);border:1px solid rgba(107,79,16,0.25);border-radius:3px;cursor:pointer;margin-bottom:7px;transition:all 0.15s;}
+.lobby-item:hover{background:rgba(212,168,75,0.1);border-color:rgba(212,168,75,0.4);}
+.lobby-item-name{font-family:'Cinzel',serif;font-size:0.85rem;color:#e0c060;}
+.lobby-item-info{font-size:0.75rem;color:rgba(212,168,75,0.5);}
+.player-item{display:flex;align-items:center;gap:10px;padding:7px 12px;background:rgba(212,168,75,0.04);border-radius:3px;margin-bottom:5px;}
+.player-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+.pdot1{background:#4a90d9;box-shadow:0 0 5px #4a90d9;}
+.pdot2{background:#e05c44;box-shadow:0 0 5px #e05c44;}
+.team-btn{padding:9px;border-radius:3px;border:2px solid transparent;cursor:pointer;font-family:'Cinzel',serif;font-size:0.75rem;transition:all 0.2s;background:rgba(10,8,4,0.8);}
+.team-btn-1{color:#4a90d9;border-color:rgba(74,144,217,0.35);}
+.team-btn-1.active,.team-btn-1:hover{border-color:#4a90d9;background:rgba(74,144,217,0.12);}
+.team-btn-2{color:#e05c44;border-color:rgba(224,92,68,0.35);}
+.team-btn-2.active,.team-btn-2:hover{border-color:#e05c44;background:rgba(224,92,68,0.12);}
+.room-code{font-family:'Cinzel',serif;font-size:2rem;color:#f0d06a;letter-spacing:0.5em;text-shadow:0 0 20px rgba(212,168,75,0.5);padding:10px 20px;border:1px solid rgba(107,79,16,0.5);border-radius:3px;}
+.err{color:#e05c44;font-size:0.78rem;min-height:16px;text-align:center;margin-top:4px;}
+
+/* ── Resource Bar ── */
+#res-bar{position:fixed;top:0;left:50%;transform:translateX(-50%);
+  background:linear-gradient(180deg,rgba(8,4,1,0.98),rgba(18,10,3,0.95));
+  border:1px solid #6b4f10;border-top:none;border-radius:0 0 14px 14px;
+  padding:7px 24px 9px;display:flex;gap:24px;align-items:center;
+  box-shadow:0 4px 20px rgba(0,0,0,0.9);pointer-events:all;z-index:100;}
+.rg{display:flex;align-items:center;gap:6px;position:relative;}
+.rg::after{content:'';position:absolute;right:-12px;top:20%;height:60%;width:1px;background:rgba(107,79,16,0.4);}
+.rg:last-child::after{display:none;}
+.ri{width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:13px;background:rgba(255,200,80,0.08);border-radius:3px;border:1px solid rgba(107,79,16,0.4);}
+.rl{color:#8a6a30;font-size:9px;font-family:'Cinzel',serif;letter-spacing:1px;text-transform:uppercase;}
+.rv{color:#f0d06a;font-size:13px;font-weight:600;min-width:40px;text-shadow:0 0 8px rgba(240,208,106,0.4);}
+.rv.low{color:#e05050!important;animation:blink 1s infinite;}
+@keyframes blink{0%,100%{opacity:1;}50%{opacity:0.5;}}
+
+/* Age badge */
+#age-badge{position:fixed;top:0;right:0;background:linear-gradient(135deg,rgba(8,4,1,0.98),rgba(25,15,4,0.95));border:1px solid #6b4f10;border-top:none;border-right:none;border-radius:0 0 0 12px;padding:7px 14px 9px 16px;pointer-events:all;z-index:100;}
+#age-name{color:#f0d06a;font-family:'Cinzel',serif;font-size:10px;letter-spacing:2px;}
+#age-icon{font-size:16px;text-align:center;}
+
+/* Team indicator */
+#team-indicator{position:fixed;top:0;left:0;background:linear-gradient(135deg,rgba(8,4,1,0.98),rgba(25,15,4,0.95));border:1px solid #6b4f10;border-top:none;border-left:none;border-radius:0 0 12px 0;padding:7px 16px 9px;z-index:100;}
+#team-label{font-family:'Cinzel',serif;font-size:10px;letter-spacing:2px;}
+
+/* ── Bottom Panel ── */
+#bottom{position:fixed;bottom:0;left:0;width:100%;height:152px;
+  background:linear-gradient(0deg,rgba(5,3,1,0.99),rgba(12,7,2,0.96));
+  border-top:1px solid #4a3208;display:flex;pointer-events:all;z-index:100;
+  box-shadow:0 -8px 40px rgba(0,0,0,0.95);}
+#mm-wrap{width:172px;min-width:172px;padding:10px;border-right:1px solid #2a1c06;display:flex;flex-direction:column;align-items:center;gap:4px;}
+#minimap{width:150px;height:118px;border:1px solid #6b4f10;cursor:pointer;image-rendering:pixelated;}
+#mm-label{color:#3a2508;font-family:'Cinzel',serif;font-size:8px;letter-spacing:2px;}
+#sel-panel{flex:1;padding:10px 12px;border-right:1px solid #2a1c06;min-width:210px;max-width:260px;display:flex;flex-direction:column;gap:5px;}
+#sel-portrait{width:42px;height:42px;border:1px solid #4a3208;background:rgba(255,255,255,0.03);border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;}
+#sel-header{display:flex;gap:8px;align-items:center;}
+#sel-name{color:#f0d06a;font-family:'Cinzel',serif;font-size:12px;font-weight:600;}
+#sel-type{color:#6a4a18;font-size:10px;font-style:italic;}
+.hb-wrap{width:100%;height:6px;background:rgba(255,255,255,0.05);border-radius:3px;overflow:hidden;border:1px solid rgba(255,255,255,0.06);}
+.hb-fill{height:100%;border-radius:3px;transition:width 0.3s,background 0.3s;}
+#sel-stats{color:#8a6a30;font-size:10px;display:flex;flex-wrap:wrap;gap:3px 10px;}
+.stat-chip{background:rgba(255,200,80,0.05);border:1px solid rgba(107,79,16,0.3);padding:1px 5px;border-radius:3px;color:#a08040;font-size:9px;}
+.stat-chip.scout{background:rgba(80,200,255,0.08);border-color:rgba(80,200,255,0.3);color:#50c8ff;}
+#sel-status{color:#5a9050;font-size:10px;font-style:italic;}
+#act-panel{width:290px;min-width:290px;padding:7px;display:grid;grid-template-columns:repeat(6,1fr);gap:3px;align-content:start;border-right:1px solid #2a1c06;}
+.ab{width:40px;height:40px;border:1px solid #2e1c06;background:linear-gradient(160deg,#1e1005,#120a02);color:#c8a050;font-size:15px;cursor:pointer;border-radius:4px;display:flex;align-items:center;justify-content:center;transition:all 0.12s;position:relative;flex-direction:column;gap:1px;}
+.ab:hover{background:linear-gradient(160deg,#3a2208,#251408);border-color:#8b6020;transform:translateY(-2px);box-shadow:0 4px 10px rgba(0,0,0,0.6),0 0 6px rgba(212,168,75,0.12);}
+.ab-key{font-size:6px;color:#4a3010;font-family:'Cinzel',serif;}
+.ab .tt{display:none;position:absolute;bottom:110%;left:50%;transform:translateX(-50%);background:rgba(8,4,1,0.98);border:1px solid #6b4f10;padding:4px 8px;color:#f0d06a;font-size:10px;white-space:nowrap;z-index:200;border-radius:3px;box-shadow:0 4px 12px rgba(0,0,0,0.8);pointer-events:none;font-family:'Crimson Text',serif;}
+.ab:hover .tt{display:block;}
+#evlog{flex:1;padding:8px 10px;overflow:hidden;}
+#evlog-title{color:#3a2510;font-family:'Cinzel',serif;font-size:8px;letter-spacing:2px;margin-bottom:4px;}
+.ev{font-size:10px;line-height:1.6;border-left:2px solid transparent;padding-left:5px;}
+.ev.good{color:#5a8c3a;border-color:#3a6020;}
+.ev.bad{color:#9c3030;border-color:#7a2020;}
+.ev.info{color:#3a6890;border-color:#285070;}
+.ev.warn{color:#a07820;border-color:#806010;}
+
+/* ── AI Panel ── */
+#ai-panel{position:fixed;top:58px;left:10px;width:175px;background:rgba(5,2,0,0.92);border:1px solid #3a1a08;border-radius:5px;padding:8px;pointer-events:none;z-index:100;}
+#ai-title{color:#7a3020;font-family:'Cinzel',serif;font-size:8px;letter-spacing:2px;margin-bottom:5px;border-bottom:1px solid #2a1005;padding-bottom:3px;}
+.ai-res{display:flex;justify-content:space-between;color:#6a3020;font-size:9px;line-height:1.7;}
+.ai-res span{color:#9a4030;}
+#ai-status{color:#6a3020;font-size:9px;font-style:italic;margin-top:3px;border-top:1px solid #1a0a02;padding-top:3px;}
+
+/* ── Selection box ── */
+#selbox{position:fixed;border:1px solid rgba(125,220,94,0.7);background:rgba(125,220,94,0.04);pointer-events:none;display:none;z-index:50;}
+
+/* ── Alerts ── */
+#alerts{position:fixed;top:62px;right:10px;display:flex;flex-direction:column;gap:5px;pointer-events:none;z-index:150;}
+.alert-msg{background:linear-gradient(135deg,rgba(8,4,1,0.97),rgba(18,10,3,0.95));border:1px solid #6b4f10;color:#f0d06a;padding:7px 14px;font-size:11px;border-radius:4px;animation:aSlide 0.3s ease,aFade 0.5s ease 3.2s forwards;max-width:240px;box-shadow:0 4px 16px rgba(0,0,0,0.7);font-family:'Crimson Text',serif;}
+.alert-msg.red{border-color:#6b1010;color:#ff9090;}
+@keyframes aSlide{from{transform:translateX(20px);opacity:0;}to{transform:translateX(0);opacity:1;}}
+@keyframes aFade{to{opacity:0;}}
+
+/* ── Ghost build cursor ── */
+#build-cursor{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-200%);background:rgba(8,4,1,0.92);border:1px solid #d4a84b;border-radius:7px;padding:6px 14px;color:#f0d06a;font-family:'Cinzel',serif;font-size:11px;letter-spacing:1px;pointer-events:none;z-index:200;box-shadow:0 4px 16px rgba(0,0,0,0.8);}
+#build-cursor.active{display:block;}
+
+/* ── Tech popup ── */
+#tech-pop{display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:linear-gradient(160deg,rgba(8,4,1,0.99),rgba(18,10,3,0.99));border:1px solid #6b4f10;border-radius:7px;padding:20px;min-width:400px;max-height:80vh;overflow-y:auto;z-index:500;pointer-events:all;box-shadow:0 20px 60px rgba(0,0,0,0.95);}
+#tech-pop h2{color:#f0d06a;font-family:'Cinzel',serif;font-size:16px;margin-bottom:12px;border-bottom:1px solid #3a2208;padding-bottom:7px;letter-spacing:2px;}
+.ti{display:flex;gap:10px;padding:8px;border:1px solid #2a1505;border-radius:4px;margin-bottom:6px;cursor:pointer;transition:all 0.15s;align-items:center;}
+.ti:hover{border-color:#6b4f10;background:rgba(212,168,75,0.04);}
+.ti.done{border-color:#2a4020;cursor:default;opacity:0.5;}
+.ti.locked{opacity:0.3;cursor:not-allowed;}
+.ti-icon{font-size:20px;width:32px;text-align:center;}
+.ti-body{flex:1;}
+.ti-name{color:#e0c060;font-family:'Cinzel',serif;font-size:11px;margin-bottom:2px;}
+.ti-cost{color:#6a4a18;font-size:9px;}
+.ti-desc{color:#7a5a30;font-size:9px;font-style:italic;}
+.ti-check{color:#4a8c3a;font-size:13px;}
+.tp-close{position:absolute;top:12px;right:14px;color:#4a3010;cursor:pointer;font-size:15px;transition:color 0.15s;font-family:'Cinzel',serif;}
+.tp-close:hover{color:#f0d06a;}
+
+/* ── Resource gain popups ── */
+.res-popup{position:fixed;pointer-events:none;font-family:'Cinzel',serif;font-size:11px;font-weight:600;text-shadow:0 1px 3px rgba(0,0,0,0.9);z-index:150;white-space:nowrap;}
+
+/* ── Controls hint ── */
+#controls-hint{position:fixed;bottom:162px;right:10px;font-size:9px;color:rgba(212,168,75,0.25);pointer-events:none;line-height:1.9;z-index:100;font-family:'Cinzel',serif;}
+
+/* Chat */
+#chat-box{position:fixed;bottom:162px;left:182px;width:280px;background:rgba(5,3,1,0.88);border:1px solid rgba(107,79,16,0.5);border-radius:4px;z-index:120;}
+#chat-messages{max-height:110px;overflow-y:auto;padding:7px 9px;display:flex;flex-direction:column;gap:3px;}
+.chat-msg{font-size:10px;}
+.chat-name{font-weight:600;}
+.chat-name.t1{color:#4a90d9;}.chat-name.t2{color:#e05c44;}
+#chat-input-row{display:flex;border-top:1px solid rgba(107,79,16,0.4);}
+#chat-input{flex:1;padding:5px 7px;background:transparent;border:none;outline:none;color:#c8a050;font-size:10px;font-family:'Crimson Text',serif;}
+#chat-send{padding:5px 9px;background:rgba(212,168,75,0.08);border:none;border-left:1px solid rgba(107,79,16,0.4);color:#d4a84b;cursor:pointer;font-size:10px;}
+
+/* Scrollbars */
+::-webkit-scrollbar{width:4px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:#4a3008;border-radius:2px;}
+
+/* Game Over */
+#screen-gameover{z-index:1000;flex-direction:column;gap:18px;}
+#gameover-title{font-family:'Cinzel',serif;font-size:3.5rem;font-weight:700;text-shadow:0 0 40px rgba(212,168,75,0.8);}
+#gameover-sub{font-family:'Cinzel',serif;color:#a08040;letter-spacing:0.2em;font-size:0.95rem;}
+</style>
+</head>
+<body>
+
+<div id="loading">
+  <div id="loading-crest">⚔</div>
+  <h1>AGE OF REALMS</h1>
+  <div id="loading-sub">FORGING THE REALM</div>
+  <div id="loading-bar-wrap"><div id="loading-fill"></div></div>
+  <div id="loading-tip">Two civilizations rise. Only one shall endure.</div>
+</div>
+
+<!-- Title -->
+<div id="screen-title" class="screen hidden" style="flex-direction:column;gap:0;">
+  <div style="font-size:70px;margin-bottom:8px;filter:drop-shadow(0 0 25px rgba(212,168,75,0.7));animation:pulse 4s ease-in-out infinite;">⚔</div>
+  <h1 class="game-title" style="margin-bottom:4px;">AGE OF REALMS</h1>
+  <p style="font-family:'Cinzel',serif;font-size:0.75rem;letter-spacing:0.4em;color:#7a5c28;margin-bottom:40px;">MULTIPLAYER STRATEGY</p>
+  <div style="display:flex;flex-direction:column;gap:14px;width:320px;position:relative;z-index:10;">
+    <input class="gold-input" id="name-input" type="text" maxlength="20" placeholder="Enter your name..." autocomplete="off">
+    <div class="err" id="name-error"></div>
+    <button class="btn-gold" onclick="enterLobby()">ENTER THE REALM</button>
+  </div>
+</div>
+
+<!-- Lobby -->
+<div id="screen-lobby" class="screen hidden" style="flex-direction:column;gap:22px;padding:20px;overflow-y:auto;">
+  <div style="text-align:center;">
+    <h2 style="font-family:'Cinzel',serif;font-size:1.6rem;color:#d4a84b;letter-spacing:0.15em;">CHOOSE YOUR BATTLE</h2>
+    <p style="font-size:0.82rem;color:#6a4a18;letter-spacing:0.2em;margin-top:4px;">Welcome, <span id="lobby-player-name" style="color:#d4a84b"></span></p>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;width:min(860px,100%);">
+    <div class="panel">
+      <h3>Active Games</h3>
+      <div id="lobby-list" style="max-height:240px;overflow-y:auto;margin-bottom:12px;"></div>
+      <div style="display:flex;gap:8px;margin-bottom:10px;">
+        <input class="gold-input" id="join-id-input" style="font-size:0.78rem;padding:7px 12px;" placeholder="Room code..." maxlength="6">
+        <button class="btn-sm" onclick="joinByCode()">JOIN</button>
+      </div>
+      <div class="err" id="join-error"></div>
+      <button class="btn-sm" onclick="refreshLobbies()" style="width:100%;margin-top:4px;">↻ REFRESH</button>
+    </div>
+    <div class="panel">
+      <h3>Create New Game</h3>
+      <input class="gold-input" id="lobby-name-input" style="margin-bottom:12px;" placeholder="Game name..." maxlength="30">
+      <button class="btn-gold" onclick="createLobby()">CREATE GAME</button>
+    </div>
+  </div>
+</div>
+
+<!-- Room -->
+<div id="screen-room" class="screen hidden" style="flex-direction:column;gap:18px;padding:20px;">
+  <div style="text-align:center;">
+    <div style="font-size:0.7rem;font-family:'Cinzel',serif;letter-spacing:0.3em;color:#6a4a18;margin-bottom:5px;text-transform:uppercase;">Room Code</div>
+    <div class="room-code" id="room-code-display">------</div>
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;width:min(680px,100%);">
+    <div class="panel">
+      <h3>Players</h3>
+      <div id="room-player-list"></div>
+    </div>
+    <div class="panel">
+      <h3>Your Team</h3>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;">
+        <button class="team-btn team-btn-1" id="btn-team1" onclick="switchTeam(1)">⚔ TEAM BLUE</button>
+        <button class="team-btn team-btn-2" id="btn-team2" onclick="switchTeam(2)">🔥 TEAM RED</button>
+      </div>
+      <div style="font-size:0.78rem;color:#5a4020;margin-bottom:14px;text-align:center;font-style:italic;">Waiting for players...</div>
+      <button class="btn-gold" id="btn-start" onclick="startGame()">⚔ BEGIN BATTLE</button>
+      <button class="btn-sm" onclick="leaveLobby()" style="width:100%;margin-top:10px;">← Leave</button>
+    </div>
+  </div>
+</div>
+
+<!-- Game canvas -->
+<canvas id="canvas"></canvas>
+
+<!-- HUD (shown only during game) -->
+<div id="game-hud" style="display:none;">
+  <div id="build-cursor">🏗 Left-click to place · Right-click to cancel</div>
+
+  <div id="res-bar">
+    <div class="rg"><div class="ri">🌾</div><div><div class="rl">Food</div><div class="rv" id="r-food">200</div></div></div>
+    <div class="rg"><div class="ri">🪵</div><div><div class="rl">Wood</div><div class="rv" id="r-wood">200</div></div></div>
+    <div class="rg"><div class="ri">⛏</div><div><div class="rl">Gold</div><div class="rv" id="r-gold">100</div></div></div>
+    <div class="rg"><div class="ri">🪨</div><div><div class="rl">Stone</div><div class="rv" id="r-stone">100</div></div></div>
+    <div class="rg"><div class="ri">👥</div><div><div class="rl">Pop</div><div class="rv" id="r-pop">0/10</div></div></div>
+    <div class="rg"><div class="ri">🏆</div><div><div class="rl">Score</div><div class="rv" id="r-score">0</div></div></div>
+  </div>
+
+  <div id="age-badge"><div id="age-icon">🏚</div><div id="age-name">DARK AGE</div></div>
+  <div id="team-indicator"><div id="team-label" style="color:#4a90d9;">⚔ TEAM BLUE</div></div>
+
+  <div id="bottom">
+    <div id="mm-wrap">
+      <canvas id="minimap" width="150" height="118"></canvas>
+      <div id="mm-label">TACTICAL MAP</div>
+    </div>
+    <div id="sel-panel">
+      <div id="sel-header">
+        <div id="sel-portrait">🏰</div>
+        <div><div id="sel-name">No Selection</div><div id="sel-type">Click a unit or building</div></div>
+      </div>
+      <div class="hb-wrap"><div class="hb-fill" id="sel-hp" style="width:100%;background:#4caf50;"></div></div>
+      <div id="sel-stats"></div>
+      <div id="sel-status"></div>
+    </div>
+    <div id="act-panel"></div>
+    <div id="evlog">
+      <div id="evlog-title">CHRONICLES</div>
+      <div id="ev-entries"></div>
+    </div>
+  </div>
+
+  <div id="ai-panel">
+    <div id="ai-title">⚔ ENEMY EMPIRE</div>
+    <div class="ai-res"><span>Food:</span><span id="ai-food">-</span></div>
+    <div class="ai-res"><span>Wood:</span><span id="ai-wood">-</span></div>
+    <div class="ai-res"><span>Gold:</span><span id="ai-gold">-</span></div>
+    <div class="ai-res"><span>Pop:</span><span id="ai-pop">-</span></div>
+    <div id="ai-status">Establishing base...</div>
+  </div>
+
+  <div id="selbox"></div>
+  <div id="alerts"></div>
+
+  <div id="chat-box">
+    <div id="chat-messages"></div>
+    <div id="chat-input-row">
+      <input type="text" id="chat-input" placeholder="Say something..." maxlength="200">
+      <button id="chat-send" onclick="sendChat()">Send</button>
+    </div>
+  </div>
+
+  <div id="controls-hint">
+    WASD: Pan · Scroll: Zoom<br>
+    Q/E: Rotate · Click: Select<br>
+    Drag: Multi-select<br>
+    RMB: Move/Attack/Gather<br>
+    B: Build · R: Research<br>
+    Esc: Deselect
+  </div>
+</div>
+
+<!-- Tech popup -->
+<div id="tech-pop">
+  <span class="tp-close" onclick="closeTech()">✕ CLOSE</span>
+  <h2>⚗ TECHNOLOGIES</h2>
+  <div id="tech-list"></div>
+</div>
+
+<!-- Game Over -->
+<div id="screen-gameover" class="screen hidden">
+  <div id="gameover-title" style="color:#f0d06a;">VICTORY!</div>
+  <div id="gameover-sub">TEAM WINS THE BATTLE</div>
+  <button class="btn-gold" style="width:240px;margin-top:16px;" onclick="returnToLobby()">← Return to Lobby</button>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="/socket.io/socket.io.js"></script>
+<script src="/js/game.js"></script>
+</body>
+</html>
