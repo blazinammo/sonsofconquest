@@ -47,6 +47,9 @@ const envObjects = [];   // { mesh, x, z }
 // ── Selection ─────────────────────────────────────────────────
 let selectedUnitIds = [], selectedBuildingId = null, selectedResNodeId = null;
 
+// ── Idle villager tracker ──────────────────────────────────────────────────
+let _idleVillagerIndex = 0; // which idle villager to jump to next
+
 // ── Rally point visuals ────────────────────────────────────────────────────
 // A dashed line from the building to its rally point + a flag marker
 let _rallyLine = null;   // THREE.Line
@@ -1373,6 +1376,40 @@ function syncGameState(state){
 // =================================================================
 //  UI — Resources
 // =================================================================
+// ── Idle villager functions ──────────────────────────────────────────────────
+function getIdleVillagers(){
+  return Object.values(serverUnits).filter(u=>
+    u&&u.team===myTeam&&u.type==='Villager'&&u.state==='idle'
+  );
+}
+function updateIdleVillagerUI(){
+  const wrap=document.getElementById('idle-vill-wrap');
+  const cnt=document.getElementById('idle-vill-count');
+  if(!wrap||!cnt)return;
+  const idle=getIdleVillagers();
+  if(idle.length>0){
+    wrap.style.display='';
+    cnt.textContent=idle.length;
+  } else {
+    wrap.style.display='none';
+    _idleVillagerIndex=0;
+  }
+}
+function cycleIdleVillager(){
+  const idle=getIdleVillagers();
+  if(!idle.length)return;
+  _idleVillagerIndex=_idleVillagerIndex%idle.length;
+  const u=idle[_idleVillagerIndex];
+  _idleVillagerIndex=(_idleVillagerIndex+1)%idle.length;
+  // Select this villager
+  deselAll();
+  selUnit(u.id);
+  // Pan camera to the villager
+  const mesh=unitMeshes[u.id];
+  if(mesh){camTarget.x=mesh.position.x;camTarget.z=mesh.position.z;}
+  else{camTarget.x=u.x;camTarget.z=u.z;}
+}
+
 function updateResUI(t){
   if(!t)t=serverTeams[myTeam]||{};
   const lo=v=>v<30;
@@ -1949,6 +1986,19 @@ function startGameClient(){
   fowReveal(mySpawnX,mySpawnZ,18);
 
   // Log
+  // Inject idle villager button into res-bar
+  const resBar=document.getElementById('res-bar');
+  if(resBar&&!document.getElementById('idle-vill-btn')){
+    const idleDiv=document.createElement('div');
+    idleDiv.className='rg';
+    idleDiv.id='idle-vill-wrap';
+    idleDiv.style.cssText='cursor:pointer;display:none;';
+    idleDiv.innerHTML='<div class="ri" style="background:rgba(255,160,30,0.15);border-color:rgba(255,160,30,0.5);">👷</div>'
+      +'<div><div class="rl" style="color:#a06820;">IDLE</div>'
+      +'<div class="rv" id="idle-vill-count" style="color:#ffaa20;">0</div></div>';
+    idleDiv.addEventListener('click',cycleIdleVillager);
+    resBar.appendChild(idleDiv);
+  }
   logEv('⚔ Your empire begins. Build and conquer!','good');
   logEv('🌫 Fog of war active. Explore to reveal.','warn');
   logEv(`🎮 You are ${myTeam===1?'Team Blue':'Team Red'}`,'info');
@@ -2013,7 +2063,7 @@ function startRenderLoop(){
     tickWater(gameTime);
 
     mmTimer+=dt;if(mmTimer>0.15){mmTimer=0;drawMinimap();}
-    resTimer+=dt;if(resTimer>0.5){resTimer=0;updateResUI();}
+    resTimer+=dt;if(resTimer>0.5){resTimer=0;updateResUI();updateIdleVillagerUI();}
     selTimer+=dt;if(selTimer>0.25){selTimer=0;if(selectedUnitIds.length||selectedBuildingId||selectedResNodeId)refreshSelUI();}
 
     renderer.autoClear=true;
