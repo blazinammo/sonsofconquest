@@ -3,6 +3,7 @@ const { createServer } = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
+const { tickAI: tickAIPlayer } = require('./ai');
 
 const app = express();
 const httpServer = createServer(app);
@@ -195,15 +196,14 @@ function createLobby(name,hostId){
   su('Villager',pox-3,poz-3,1,'team1');su('Villager',pox-3,poz,1,'team1');su('Villager',pox-3,poz+3,1,'team1');su('Scout',pox+3,poz,1,'team1');
   su('Villager',aox-4,aoz-3,2,'team2');su('Villager',aox-4,aoz,2,'team2');su('Villager',aox-4,aoz+3,2,'team2');su('Scout',aox+3,aoz,2,'team2');
 
-  return{id,name,hostId,status:'waiting',players:{},
+  return{id,name,hostId,status:'waiting',players:{},aiPlayers:{},
     gs:{units,buildings,teams,resNodes,heights,pox,poz,aox,aoz,gameTime:0,tc1:tc1.id,tc2:tc2.id,events:[],projPool:[],incomeTimer:0},
-    ai:{state:'expanding',attackTimer:0,buildTimer:0,researchTimer:0,trainCheckTimer:0,army:[],isAttacking:false,buildIdx:0,
-      buildQueue:['House','Farm','Lumbercamp','Farm','House','MiningCamp','Farm','House','Barracks','House','Tower']},
+    aiState:{},
     tickInterval:null};
 }
 
 function gameTick(lobby){
-  const{gs,ai}=lobby, dt=TICK/1000;
+  const{gs}=lobby, dt=TICK/1000;
   const{units,buildings,teams,resNodes,heights}=gs;
   gs.gameTime+=dt;
 
@@ -396,7 +396,6 @@ function gameTick(lobby){
         const nu=mkUnit(type,ox,oz,b.team,b.ownerId||('team'+b.team));
         units[nu.id]=nu;t.population+=(def.pop||1);
         gs.events.push({type:'trained',unitType:type,team:b.team});
-        if(b.team===2)ai.army.push(nu.id);
       }
     }
   }
@@ -414,8 +413,11 @@ function gameTick(lobby){
     }
   }
 
-  // ─ AI ─
-  tickAI(lobby,dt);
+  // ─ AI players ─
+  const aiCtx={uid,UDEFS,BCOSTS,BHPS,BSIZES,MAP,HALF,URES,VRES};
+  for(const[team,aiP] of Object.entries(lobby.aiPlayers||{})){
+    tickAIPlayer(lobby, dt, Number(team), aiP.difficulty, aiCtx);
+  }
 
   // ─ Score ─
   teams[1].score+=dt*0.5;teams[2].score+=dt*0.5;
@@ -445,36 +447,6 @@ function gameTick(lobby){
   });
 }
 
-function tickAI(lobby,dt){
-  const humanOnTeam2=Object.values(lobby.players).some(p=>p.team===2);
-  if(humanOnTeam2) return;
-  const{gs,ai}=lobby;const{units,buildings,teams,resNodes,heights}=gs;
-  const td=teams[2];
-  function iW(x,z){return isW(x,z,heights);}
-  ai.buildTimer+=dt;ai.attackTimer+=dt;ai.researchTimer+=dt;ai.trainCheckTimer+=dt;
-
-  for(const id in units){const v=units[id];if(v.dead||v.team!==2||v.type!=='Villager'||v.state!=='idle')continue;let best=null,bd=999;for(const rn of resNodes){if(rn.depleted||rn.amount<=0)continue;const d=dist2D(v.x,v.z,rn.x,rn.z);if(d<bd){bd=d;best=rn;}}if(best){v.gatherTarget=best.id;v.state='moving_to_gather';v.tx=best.x+(Math.random()-0.5);v.tz=best.z+(Math.random()-0.5);}}
-
-  if(ai.buildTimer>20&&ai.buildIdx<ai.buildQueue.length){
-    const bType=ai.buildQueue[ai.buildIdx],cost=BCOSTS[bType]||{};
-    if(afford(td,cost)){spend(td,cost);let bx,bz;for(let i=0;i<10;i++){const a=Math.random()*Math.PI*2,r=6+Math.random()*8;bx=gs.aox+Math.cos(a)*r;bz=gs.aoz+Math.sin(a)*r;if(!iW(bx,bz))break;}
-      if(!iW(bx,bz)){const b=mkBuilding(bType,bx,bz,2,'team2');buildings[b.id]=b;if(bType==='House')td.maxPop+=5;gs.events.push({msg:`Enemy built ${bType}!`,type:'warn'});ai.buildIdx++;ai.buildTimer=0;}}
-  }
-
-  const aiVills=Object.values(units).filter(u=>!u.dead&&u.team===2&&u.type==='Villager').length;
-  const aiTC=Object.values(buildings).find(b=>b.team===2&&b.type==='Town Center'&&!b.dead);
-  if(aiTC&&!aiTC.productionQueue.length&&aiVills<6&&td.population<td.maxPop-1&&afford(td,UDEFS.Villager.cost)){spend(td,UDEFS.Villager.cost);aiTC.productionQueue.push('Villager');}
-
-  const aiBar=Object.values(buildings).filter(b=>b.team===2&&b.type==='Barracks'&&!b.dead);
-  if(ai.trainCheckTimer>=8&&gs.gameTime>240){ai.trainCheckTimer=0;const armySize=ai.army.filter(id=>units[id]&&!units[id].dead).length;const cap=3+Math.floor(gs.gameTime/300);if(armySize<cap)for(const bar of aiBar){if(bar.productionQueue.length>0)continue;if(afford(td,UDEFS.Swordsman.cost)&&td.population+1<=td.maxPop){spend(td,UDEFS.Swordsman.cost);bar.productionQueue.push('Swordsman');bar.ownerId='team2';break;}}}
-
-  if(td.age===0&&td.food>=800&&gs.gameTime>360&&!td.researched.includes('Feudal Age')){td.food-=500;td.age=1;td.researched.push('Feudal Age');gs.events.push({msg:'Enemy advances to Feudal Age!',type:'warn'});ai.buildQueue.push('Barracks','Tower','House');}
-
-  const ready=ai.army.filter(id=>units[id]&&!units[id].dead);
-  if(ready.length>=8&&ai.attackTimer>300&&gs.gameTime>360){ai.isAttacking=true;ai.attackTimer=0;gs.events.push({msg:`Enemy assault! ${ready.length} warriors!`,type:'bad'});const ptc=buildings[gs.tc1];const ptx=ptc?ptc.x:0,ptz=ptc?ptc.z:0;for(const id of ready){const u=units[id];if(!u)continue;let ax=ptx+(Math.random()-0.5)*8,az=ptz+(Math.random()-0.5)*8;if(iW(ax,az)){ax=ptx;az=ptz;}u.tx=ax;u.tz=az;u.state='moving_to_attack';}}
-  if(!ai.isAttacking)for(const id of ready){const u=units[id];if(!u||u.state!=='idle')continue;let rx=gs.aox+(Math.random()-0.5)*8,rz=gs.aoz+(Math.random()-0.5)*8;if(iW(rx,rz)){rx=gs.aox;rz=gs.aoz;}u.tx=rx;u.tz=rz;u.state='moving';}
-  if(ready.every(id=>!units[id]||units[id].dead))ai.isAttacking=false;
-}
 
 function endGame(lobby,winner){
   lobby.status='ended';if(lobby.tickInterval)clearInterval(lobby.tickInterval);
@@ -482,7 +454,14 @@ function endGame(lobby,winner){
 }
 
 const lobbies={},players={};
-function getLobbyPlayers(l){return Object.values(l.players).map(p=>({id:p.id,name:p.name,team:p.team}));}
+function getLobbyPlayers(l){
+  const humans=Object.values(l.players).map(p=>({id:p.id,name:p.name,team:p.team,isAI:false}));
+  const ais=Object.entries(l.aiPlayers||{}).map(([team,ai])=>({
+    id:'ai_'+team,name:`AI · ${ai.difficulty.charAt(0).toUpperCase()+ai.difficulty.slice(1)}`,
+    team:Number(team),isAI:true,difficulty:ai.difficulty
+  }));
+  return [...humans,...ais];
+}
 
 io.on('connection',socket=>{
   console.log('Connected:',socket.id);
@@ -540,8 +519,14 @@ io.on('connection',socket=>{
     const gs=lobby.gs;
     const teamToSocket={};
     for(const[sid,pl] of Object.entries(lobby.players)) teamToSocket[pl.team]=sid;
-    for(const u of Object.values(gs.units)){if(teamToSocket[u.team])u.ownerId=teamToSocket[u.team];}
-    for(const b of Object.values(gs.buildings)){if(teamToSocket[b.team])b.ownerId=teamToSocket[b.team];}
+    for(const u of Object.values(gs.units)){
+      if(teamToSocket[u.team]) u.ownerId=teamToSocket[u.team];
+      else if(lobby.aiPlayers[u.team]) u.ownerId='ai_team_'+u.team;
+    }
+    for(const b of Object.values(gs.buildings)){
+      if(teamToSocket[b.team]) b.ownerId=teamToSocket[b.team];
+      else if(lobby.aiPlayers[b.team]) b.ownerId='ai_team_'+b.team;
+    }
     for(const[sid,pl] of Object.entries(lobby.players)){
       io.to(sid).emit('gameStarted',{
         units:gs.units,buildings:gs.buildings,teams:gs.teams,team:pl.team,
@@ -614,6 +599,28 @@ io.on('connection',socket=>{
       if(cmd.techId==='Plate Armor')for(const u of Object.values(units)){if(u.team===p.team)u.def+=4;}
       socket.emit('techResearched',{techId:cmd.techId,team:p.team});
     }
+  });
+
+  socket.on('addAI',({team,difficulty})=>{
+    const p=players[socket.id];if(!p||!p.lobbyId)return;
+    const lobby=lobbies[p.lobbyId];
+    if(!lobby||lobby.status!=='waiting'||lobby.hostId!==socket.id)return;
+    const t=Number(team);
+    if(Object.values(lobby.players).some(pl=>pl.team===t)){
+      socket.emit('error',{message:'That team already has a human player'});return;
+    }
+    if(!['easy','moderate','hard'].includes(difficulty)) return;
+    if(!lobby.aiPlayers) lobby.aiPlayers={};
+    lobby.aiPlayers[t]={difficulty};
+    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby)});
+  });
+
+  socket.on('removeAI',({team})=>{
+    const p=players[socket.id];if(!p||!p.lobbyId)return;
+    const lobby=lobbies[p.lobbyId];
+    if(!lobby||lobby.status!=='waiting'||lobby.hostId!==socket.id)return;
+    if(lobby.aiPlayers) delete lobby.aiPlayers[Number(team)];
+    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby)});
   });
 
   socket.on('chatMessage',({text})=>{

@@ -59,7 +59,8 @@ let sun, fillLight, sky;
 
 // ── FOW ───────────────────────────────────────────────────────
 const FOW_RES = 256, FOW_CELLS = 240, FOW_CELL = MAP / FOW_CELLS;
-const fow = new Uint8Array(FOW_CELLS * FOW_CELLS);
+const fow    = new Uint8Array(FOW_CELLS * FOW_CELLS);   // integer state: 0=dark,1=shroud,2=visible
+const fowVis = new Float32Array(FOW_CELLS * FOW_CELLS); // float level: 0.0=dark, 0.5=shroud, 1.0=visible
 const fowPixels = new Uint8Array(FOW_RES * FOW_RES * 4);
 let fowTexture = null, fowOrthoScene = null, fowOrthoCamera = null, fowQuadMat = null;
 let fowTimer = 0;
@@ -139,12 +140,23 @@ function fowCell(wx,wz){
 function fowReveal(wx,wz,radiusWorld){
   const cx0=Math.floor((wx+HALF)/FOW_CELL);
   const cz0=Math.floor((wz+HALF)/FOW_CELL);
-  const cr=Math.ceil(radiusWorld/FOW_CELL), cr2=cr*cr;
+  const cr=Math.ceil(radiusWorld/FOW_CELL)+1; // +1 to include gradient fringe cells
+  const fadeStart=radiusWorld*0.70; // inner 70% is fully visible
   for(let dz=-cr;dz<=cr;dz++) for(let dx=-cr;dx<=cr;dx++){
-    if(dx*dx+dz*dz>cr2) continue;
     const nx=cx0+dx,nz=cz0+dz;
     if(nx<0||nz<0||nx>=FOW_CELLS||nz>=FOW_CELLS) continue;
-    fow[fowIdx(nx,nz)]=2;
+    // World-space distance from unit to this cell's centre
+    const cellWX=-HALF+(nx+0.5)*FOW_CELL;
+    const cellWZ=-HALF+(nz+0.5)*FOW_CELL;
+    const dist=Math.sqrt((cellWX-wx)**2+(cellWZ-wz)**2);
+    if(dist>radiusWorld) continue;
+    // Smooth falloff: 1.0 in core, fades to 0.5 at exact radius edge
+    const vis=dist<=fadeStart
+      ? 1.0
+      : 0.5+0.5*(1.0-(dist-fadeStart)/(radiusWorld-fadeStart));
+    const idx=fowIdx(nx,nz);
+    if(fowVis[idx]<vis) fowVis[idx]=vis;
+    fow[idx]=2; // integer state for game logic queries
   }
 }
 function initFOWPlane(){
@@ -177,21 +189,27 @@ function initFOWPlane(){
   fowQuadMat=qm;
   fowOrthoScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2,2),qm));
 }
-const _fowRaw=new Float32Array(FOW_CELLS*FOW_CELLS),_fowTmp=new Float32Array(FOW_CELLS*FOW_CELLS),_fowBlurred=new Float32Array(FOW_CELLS*FOW_CELLS);
+function _fowVisToAlpha(v){
+  // Piecewise: 0.0→255 (full dark), 0.5→195 (shroud), 1.0→0 (clear)
+  if(v<=0.5) return 255-v*120;           // 255 at 0.0, 195 at 0.5
+  return 195*(1-(v-0.5)*2);             // 195 at 0.5, 0 at 1.0
+}
 function updateFOWTexture(){
   const N=FOW_CELLS;
-  const raw=_fowRaw,tmp=_fowTmp,blurred=_fowBlurred;
-  for(let i=0;i<N*N;i++) raw[i]=fow[i]===0?255:fow[i]===1?195:0;
-  const R=3;
-  for(let py=0;py<N;py++){let sum=0;for(let px=0;px<R;px++)sum+=raw[py*N+px];for(let px=0;px<N;px++){if(px+R<N)sum+=raw[py*N+px+R];if(px-R-1>=0)sum-=raw[py*N+px-R-1];tmp[py*N+px]=sum/(Math.min(px+R,N-1)-Math.max(px-R,0)+1);}}
-  for(let px=0;px<N;px++){let sum=0;for(let py=0;py<R;py++)sum+=tmp[py*N+px];for(let py=0;py<N;py++){if(py+R<N)sum+=tmp[(py+R)*N+px];if(py-R-1>=0)sum-=tmp[(py-R-1)*N+px];blurred[py*N+px]=sum/(Math.min(py+R,N-1)-Math.max(py-R,0)+1);}}
+  // Bilinearly upsample fowVis (float) directly into the texture — no box blur needed.
+  // The smooth gradients written by fowReveal already give soft edges.
   for(let py=0;py<FOW_RES;py++) for(let px=0;px<FOW_RES;px++){
-    const gx=(px/FOW_RES)*(N-1),gz=((FOW_RES-1-py)/FOW_RES)*(N-1);
-    const x0=Math.floor(gx),x1=Math.min(x0+1,N-1),z0=Math.floor(gz),z1=Math.min(z0+1,N-1);
-    const fx=gx-x0,fz=gz-z0;
-    const a=blurred[z0*N+x0]*(1-fx)*(1-fz)+blurred[z0*N+x1]*fx*(1-fz)+blurred[z1*N+x0]*(1-fx)*fz+blurred[z1*N+x1]*fx*fz;
+    const gx=(px/FOW_RES)*(N-1), gz=((FOW_RES-1-py)/FOW_RES)*(N-1);
+    const x0=Math.floor(gx),x1=Math.min(x0+1,N-1);
+    const z0=Math.floor(gz),z1=Math.min(z0+1,N-1);
+    const fx=gx-x0, fz=gz-z0;
+    const v=fowVis[z0*N+x0]*(1-fx)*(1-fz)
+           +fowVis[z0*N+x1]*fx*(1-fz)
+           +fowVis[z1*N+x0]*(1-fx)*fz
+           +fowVis[z1*N+x1]*fx*fz;
     const idx=(py*FOW_RES+px)*4;
-    fowPixels[idx]=8;fowPixels[idx+1]=10;fowPixels[idx+2]=18;fowPixels[idx+3]=Math.round(a);
+    fowPixels[idx]=8;fowPixels[idx+1]=10;fowPixels[idx+2]=18;
+    fowPixels[idx+3]=Math.round(_fowVisToAlpha(v));
   }
   fowTexture.needsUpdate=true;
 }
@@ -199,12 +217,22 @@ function tickFOW(dt){
   fowTimer+=dt;
   if(fowTimer<0.15) return;
   fowTimer=0;
-  for(let i=0;i<fow.length;i++) if(fow[i]===2) fow[i]=1;
-  // Reveal from my units
+  for(let i=0;i<fow.length;i++){
+    if(fow[i]===2){
+      fow[i]=1;
+      // Clamp to shroud level — preserve partial visibility from last reveal
+      if(fowVis[i]>0.5) fowVis[i]=0.5;
+    }
+  }
+  // Reveal from my units — use interpolated mesh position so the
+  // revealed circle is always centred on where the unit visually appears
   for(const id in serverUnits){
     const u=serverUnits[id];
     if(u.team!==myTeam) continue;
-    fowReveal(u.x,u.z,u.vision||7);
+    const mesh=unitMeshes[id];
+    const rx=mesh?mesh.position.x:u.x;
+    const rz=mesh?mesh.position.z:u.z;
+    fowReveal(rx,rz,u.vision||7);
   }
   // Reveal from my buildings
   for(const id in serverBuildings){
@@ -257,20 +285,19 @@ function initScene(){
   renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));
   renderer.shadowMap.enabled=true;
   renderer.shadowMap.type=THREE.PCFSoftShadowMap;
-  renderer.toneMapping=THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure=1.1;
-  renderer.outputEncoding=THREE.sRGBEncoding;
+  renderer.toneMapping=THREE.LinearToneMapping;
+  renderer.toneMappingExposure=1.0;
 
   scene=new THREE.Scene();
-  scene.background=new THREE.Color(0x7ba8d4);
-  scene.fog=new THREE.FogExp2(0x8ab8dc,0.009);
+  scene.background=new THREE.Color(0x6a8faa);
+  scene.fog=new THREE.FogExp2(0x6a8faa,0.003);
 
   camera=new THREE.PerspectiveCamera(52,innerWidth/innerHeight,0.2,300);
   camera.position.set(0,30,30);
   camera.lookAt(0,0,0);
 
   // Lighting
-  sun=new THREE.DirectionalLight(0xfff8e8,2.2);
+  sun=new THREE.DirectionalLight(0xffffff,0.45);
   sun.position.set(40,70,30);
   sun.castShadow=true;
   sun.shadow.mapSize.set(1024,1024);
@@ -279,12 +306,12 @@ function initScene(){
   sun.shadow.camera.top=105;sun.shadow.camera.bottom=-105;
   sun.shadow.bias=-0.0003;
   scene.add(sun);
-  fillLight=new THREE.DirectionalLight(0xa0c8f0,0.5);
+  fillLight=new THREE.DirectionalLight(0xddeeff,0.2);
   fillLight.position.set(-30,20,-20);
   scene.add(fillLight);
-  sky=new THREE.HemisphereLight(0xc8e0f8,0x5a7a30,0.8);
+  sky=new THREE.HemisphereLight(0xc8ddf0,0x7a9060,0.6);
   scene.add(sky);
-  scene.add(new THREE.AmbientLight(0x1a1208,1.0));
+  scene.add(new THREE.AmbientLight(0x707070,0.7));
 
   window.addEventListener('resize',()=>{
     renderer.setSize(innerWidth,innerHeight);
@@ -305,9 +332,11 @@ function buildTerrain(){
     const h=terrHeights[i];
     tPos.setZ(i,h);
     const slope=Math.abs(h);
-    const r=slope>2?0.45:0.28+slope*0.04;
-    const g=slope>2?0.40:0.48-slope*0.02;
-    const b=slope>2?0.28:0.18;
+    let r,g,b;
+    if(h<-0.4){r=0.58;g=0.54;b=0.44;}        // sandy shore — warm buff
+    else if(slope>3.0){r=0.52;g=0.50;b=0.46;}  // grey rock
+    else if(slope>1.5){r=0.42;g=0.46;b=0.36;}  // rocky grass
+    else{r=0.34+slope*0.02;g=0.42+slope*0.01;b=0.28;}  // muted grass
     tColor[i*3]=r;tColor[i*3+1]=g;tColor[i*3+2]=b;
   }
   terrGeo.setAttribute('color',new THREE.BufferAttribute(tColor,3));
@@ -787,9 +816,23 @@ function bakeMinimap(){
     const wx=(px/150)*MAP-HALF, wz=(py/118)*MAP-HALF;
     const h=getHeight(wx,wz);
     const i=(py*150+px)*4;
-    if(h<WATER_LEVEL){const depth=Math.max(0,Math.min(1,(-h-1.3)/3));imgd.data[i]=Math.round(20+depth*10);imgd.data[i+1]=Math.round(55+depth*15);imgd.data[i+2]=Math.round(110+depth*30);}
-    else if(h<0){imgd.data[i]=60;imgd.data[i+1]=90;imgd.data[i+2]=50;}
-    else{const sl=Math.abs(h);if(sl>2){imgd.data[i]=115;imgd.data[i+1]=102;imgd.data[i+2]=71;}else{imgd.data[i]=Math.round((0.28+sl*0.04)*255);imgd.data[i+1]=Math.round((0.48-sl*0.02)*255);imgd.data[i+2]=Math.round(0.18*255);}}
+    if(h<WATER_LEVEL){
+      const depth=Math.max(0,Math.min(1,(-h-1.3)/3));
+      imgd.data[i]=Math.round(20+depth*10);imgd.data[i+1]=Math.round(55+depth*15);imgd.data[i+2]=Math.round(110+depth*30);
+    } else if(h<-0.6){                 // sandy shallows
+      imgd.data[i]=158;imgd.data[i+1]=143;imgd.data[i+2]=97;
+    } else {
+      const sl=Math.abs(h);
+      if(sl>3.2){                      // bare rock
+        imgd.data[i]=130;imgd.data[i+1]=115;imgd.data[i+2]=80;
+      } else if(sl>1.8){               // rocky grass
+        imgd.data[i]=100;imgd.data[i+1]=112;imgd.data[i+2]=60;
+      } else {                         // lush grass
+        imgd.data[i]=Math.round((0.25+sl*0.03)*255);
+        imgd.data[i+1]=Math.round((0.47-sl*0.01)*255);
+        imgd.data[i+2]=Math.round(0.17*255);
+      }
+    }
     imgd.data[i+3]=255;
   }
   mmTerrainImg=imgd;
@@ -1410,13 +1453,13 @@ function spawnResGainPopupFromTeam(carry){
 
 // ── Day/Night cycle ──
 function tickDayNight(t){
-  const cycle=(Math.sin(t*0.008)+1)/2;
-  const si=0.4+cycle*1.8;
-  const sr=0.48+cycle*0.2,sg=0.66+cycle*0.12,sb=0.83+cycle*0.17;
+  // Flat overcast — no intensity swing, just a very slow gentle sky tint shift
+  const cycle=(Math.sin(t*0.005)+1)/2;
+  const sr=0.55+cycle*0.06,sg=0.64+cycle*0.06,sb=0.72+cycle*0.06;
   if(scene){scene.background=new THREE.Color(sr,sg,sb);if(scene.fog)scene.fog.color.set(sr,sg,sb);}
-  if(sun)sun.intensity=si;if(sky)sky.intensity=0.3+cycle*0.5;
-  const sa=t*0.008;
-  if(sun)sun.position.set(Math.sin(sa)*60,Math.cos(sa)*70+10,30);
+  // Sun position moves slowly for soft shadow direction change, intensity stays constant
+  const sa=t*0.005;
+  if(sun)sun.position.set(Math.sin(sa)*80,90,Math.cos(sa)*40);
 }
 function tickWater(t){
   if(waterMesh)waterMesh.position.y=-1.4+Math.sin(t*0.4)*0.06;
@@ -1559,17 +1602,78 @@ socket.on('lobbyUpdate',({players})=>{
 
 function updateRoomUI(players,team,ih){
   const list=document.getElementById('room-player-list');
-  if(list)list.innerHTML=players.map(p=>`
-    <div class="player-item">
-      <div class="player-dot ${Number(p.team)===1?'pdot1':'pdot2'}"></div>
-      <span style="color:#c8a050;font-size:0.83rem;font-family:'Cinzel',serif;">${p.name}</span>
-      <span style="margin-left:auto;font-size:0.75rem;color:${Number(p.team)===1?'#4a90d9':'#e05c44'};">Team ${p.team}</span>
-    </div>`).join('');
+  if(list)list.innerHTML=players.map(p=>{
+    const t=Number(p.team);
+    const dot=`<div class="player-dot ${t===1?'pdot1':'pdot2'}"></div>`;
+    const nameStyle='color:#c8a050;font-size:0.83rem;font-family:\'Cinzel\',serif;';
+    const badge=p.isAI
+      ?`<span style="font-size:0.68rem;padding:1px 5px;border-radius:3px;background:rgba(212,168,75,0.12);border:1px solid rgba(212,168,75,0.3);color:#a08040;margin-left:5px;">${p.difficulty}</span>`
+      :'';
+    const teamColor=t===1?'#4a90d9':'#e05c44';
+    return `<div class="player-item">
+      ${dot}
+      <span style="${nameStyle}">${p.isAI?'🤖 ':''} ${p.name}${badge}</span>
+      <span style="margin-left:auto;font-size:0.75rem;color:${teamColor};">Team ${p.team}</span>
+    </div>`;
+  }).join('');
+
   const b1=document.getElementById('btn-team1'),b2=document.getElementById('btn-team2');
   if(b1)b1.classList.toggle('active',Number(team)===1);
   if(b2)b2.classList.toggle('active',Number(team)===2);
   const bs=document.getElementById('btn-start');
   if(bs)bs.style.display=ih?'':'none';
+
+  // ── AI controls (host only) ──────────────────────────────────────────────
+  // Inject or update a panel below the start button
+  let aiCtrl=document.getElementById('ai-controls');
+  if(ih){
+    if(!aiCtrl){
+      aiCtrl=document.createElement('div');
+      aiCtrl.id='ai-controls';
+      aiCtrl.style.cssText='margin-top:12px;border-top:1px solid rgba(107,79,16,0.4);padding-top:12px;';
+      const bsParent=bs?bs.parentNode:null;
+      if(bsParent) bsParent.appendChild(aiCtrl);
+    }
+    const DIFF_OPTS='<option value="easy">Easy</option><option value="moderate" selected>Moderate</option><option value="hard">Hard</option>';
+    const SEL_STYLE='background:rgba(20,12,3,0.9);border:1px solid #6b4f10;color:#f0d06a;font-family:\'Cinzel\',serif;font-size:0.7rem;padding:3px 5px;border-radius:3px;cursor:pointer;';
+    const BTN_STYLE='padding:4px 10px;background:rgba(212,168,75,0.08);border:1px solid rgba(107,79,16,0.5);border-radius:3px;color:#d4a84b;font-family:\'Cinzel\',serif;font-size:0.68rem;cursor:pointer;letter-spacing:0.08em;';
+    const REM_STYLE='padding:4px 8px;background:rgba(160,40,40,0.15);border:1px solid rgba(160,40,40,0.4);border-radius:3px;color:#e05c44;font-family:\'Cinzel\',serif;font-size:0.68rem;cursor:pointer;';
+    const LABEL='color:#6a4a18;font-size:0.7rem;font-family:\'Cinzel\',serif;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:7px;';
+
+    function aiRowFor(teamNum,teamLabel){
+      const ai=players.find(p=>p.isAI&&Number(p.team)===teamNum);
+      const human=players.find(p=>!p.isAI&&Number(p.team)===teamNum);
+      const color=teamNum===1?'#4a90d9':'#e05c44';
+      let inner;
+      if(human){
+        inner=`<span style="font-size:0.72rem;color:${color};opacity:0.5;">Human player on this team</span>`;
+      } else if(ai){
+        inner=`<span style="color:#c8a050;font-size:0.75rem;">🤖 ${ai.difficulty.charAt(0).toUpperCase()+ai.difficulty.slice(1)} AI</span>`
+             +`<button style="${REM_STYLE}margin-left:auto;" onclick="removeAI(${teamNum})">✕ Remove</button>`;
+      } else {
+        inner=`<select id="ai-diff-${teamNum}" style="${SEL_STYLE}">${DIFF_OPTS}</select>`
+             +`<button style="${BTN_STYLE}margin-left:6px;" onclick="addAI(${teamNum})">+ Add AI</button>`;
+      }
+      return `<div style="display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid rgba(107,79,16,0.15);">
+        <span style="color:${color};font-family:'Cinzel',serif;font-size:0.7rem;min-width:65px;">${teamLabel}</span>
+        ${inner}
+      </div>`;
+    }
+
+    aiCtrl.innerHTML=`<div style="${LABEL}">🤖 AI Players</div>`
+      +aiRowFor(1,'⚔ BLUE')
+      +aiRowFor(2,'🔥 RED');
+  } else if(aiCtrl){
+    aiCtrl.remove();
+  }
+}
+
+function addAI(teamNum){
+  const sel=document.getElementById('ai-diff-'+teamNum);
+  socket.emit('addAI',{team:teamNum,difficulty:sel?sel.value:'moderate'});
+}
+function removeAI(teamNum){
+  socket.emit('removeAI',{team:teamNum});
 }
 
 socket.on('gameStarted',({units,buildings,teams,mapData,team})=>{
