@@ -131,7 +131,8 @@ function mkBuilding(type,x,z,team,ownerId,underConstruction=false){
   return{id:uid(),type,x,z,team,ownerId:ownerId||('team'+team),
     hp:underConstruction?1:maxHp,maxHp,size:BSIZES[key]||1.5,
     productionQueue:[],productionTimer:0,dead:false,atkTimer:0,
-    underConstruction,buildProgress:0,buildTime};
+    underConstruction,buildProgress:0,buildTime,
+    rallyX:null,rallyZ:null,rallyResourceId:null};
 }
 function mkUnit(type,x,z,team,ownerId){
   const d=UDEFS[type]||UDEFS.Villager;
@@ -206,6 +207,12 @@ function gameTick(lobby){
   const{gs}=lobby, dt=TICK/1000;
   const{units,buildings,teams,resNodes,heights}=gs;
   gs.gameTime+=dt;
+  // Build a Map for O(1) resNode lookups — replaces O(n) .find() calls
+  if(!gs._resMap||gs._resMapDirty){
+    gs._resMap=new Map(resNodes.map(r=>[r.id,r]));
+    gs._resMapDirty=false;
+  }
+  const resMap=gs._resMap;
 
   function iW(x,z){return isW(x,z,heights);}
   function gH(x,z){return getH(x,z,heights);}
@@ -277,19 +284,19 @@ function gameTick(lobby){
         break;
       }
       case 'moving_to_gather':{
-        const rn=gs.resNodes.find(r=>r.id===u.gatherTarget);
+        const rn=resMap.get(u.gatherTarget);
         if(!rn||rn.depleted){u.state='idle';break;}
         if(moveU(u,rn.x,rn.z)||dist2D(u.x,u.z,rn.x,rn.z)<1.5)u.state='gathering';
         break;
       }
       case 'gathering':{
-        const rn=gs.resNodes.find(r=>r.id===u.gatherTarget);
+        const rn=resMap.get(u.gatherTarget);
         if(!rn||rn.depleted||rn.amount<=0){u.state='idle';break;}
         u.gatherTimer-=dt;
         if(u.gatherTimer<=0){
           const rate=(teams[u.team].researched||[]).includes('Iron Tools')?7:5;
           const amt=Math.min(rate,rn.amount);rn.amount-=amt;u.carry[rn.type]=(u.carry[rn.type]||0)+amt;u.gatherTimer=1.0;
-          if(rn.amount<=0)rn.depleted=true;
+          if(rn.amount<=0){rn.depleted=true;gs._resMapDirty=true;}
           if(Object.values(u.carry).reduce((a,b)=>a+b,0)>=25){
             let nearTC=null,nearD=999;
             for(const bid in buildings){const b=buildings[bid];if(!b.dead&&b.team===u.team&&b.type==='Town Center'){const d=dist2D(u.x,u.z,b.x,b.z);if(d<nearD){nearD=d;nearTC=b;}}}
@@ -305,7 +312,7 @@ function gameTick(lobby){
           for(const[res,amt]of Object.entries(u.carry)){t[res]=(t[res]||0)+amt;}
           gs.events.push({type:'gather',team:u.team,carry:{...u.carry}});
           u.carry={food:0,wood:0,gold:0,stone:0};
-          const rn=gs.resNodes.find(r=>r.id===u.gatherTarget);
+          const rn=resMap.get(u.gatherTarget);
           if(rn&&!rn.depleted){u.state='moving_to_gather';u.tx=rn.x;u.tz=rn.z;}else u.state='idle';
         }
         break;
@@ -316,7 +323,11 @@ function gameTick(lobby){
   // ─ Unit separation (prevent stacking) ─
   const MIN_SEP=0.85; // minimum centre-to-centre distance in world units
   const PUSH=0.18;    // fraction of overlap to resolve per tick
-  const uArr=Object.values(units).filter(u=>!u.dead);
+  // Reuse separation array — avoid allocating a new array every tick
+  if(!gs._uArr) gs._uArr=[];
+  const uArr=gs._uArr;
+  uArr.length=0;
+  for(const id in units){if(!units[id].dead)uArr.push(units[id]);}
   for(let i=0;i<uArr.length;i++){
     const a=uArr[i];
     for(let j=i+1;j<uArr.length;j++){
@@ -396,6 +407,17 @@ function gameTick(lobby){
         const nu=mkUnit(type,ox,oz,b.team,b.ownerId||('team'+b.team));
         units[nu.id]=nu;t.population+=(def.pop||1);
         gs.events.push({type:'trained',unitType:type,team:b.team});
+        // Move to rally point if one is set
+        if(b.rallyX!==null&&b.rallyZ!==null){
+          if(b.rallyResourceId&&nu.type==='Villager'){
+            // Rally is on a resource — send villager to gather it
+            const rn=resNodes.find(r=>r.id===b.rallyResourceId&&!r.depleted);
+            if(rn){nu.gatherTarget=rn.id;nu.state='moving_to_gather';nu.tx=rn.x+(Math.random()-0.5);nu.tz=rn.z+(Math.random()-0.5);}
+            else{nu.state='moving';nu.tx=b.rallyX;nu.tz=b.rallyZ;} // resource depleted, just move
+          } else {
+            nu.state='moving';nu.tx=b.rallyX;nu.tz=b.rallyZ;
+          }
+        }
       }
     }
   }
@@ -414,7 +436,7 @@ function gameTick(lobby){
   }
 
   // ─ AI players ─
-  const aiCtx={uid,UDEFS,BCOSTS,BHPS,BSIZES,MAP,HALF,URES,VRES};
+  const aiCtx={uid,UDEFS,BCOSTS,BHPS,BSIZES,MAP,HALF,URES,VRES,resMap:gs._resMap||new Map()};
   for(const[team,aiP] of Object.entries(lobby.aiPlayers||{})){
     tickAIPlayer(lobby, dt, Number(team), aiP.difficulty, aiCtx);
   }
@@ -436,7 +458,13 @@ function gameTick(lobby){
     }
   }
   for(const id in units)if(units[id].dead)delete units[id];
-  gs.projPool=gs.projPool.filter(p=>p.life>0).map(p=>({...p,life:p.life-dt,maxLife:p.maxLife}));
+  // Mutate projPool in place — no allocations, no GC pressure
+  let pw=0;
+  for(let pr=0;pr<gs.projPool.length;pr++){
+    gs.projPool[pr].life-=dt;
+    if(gs.projPool[pr].life>0) gs.projPool[pw++]=gs.projPool[pr];
+  }
+  gs.projPool.length=pw;
 
   const unitsDelta={};
   if(!gs._unitSnap) gs._unitSnap={};
@@ -450,21 +478,30 @@ function gameTick(lobby){
     unitsDelta[id]={id:u.id,x:u.x,z:u.z,tx:u.tx,tz:u.tz,hp:u.hp,maxHp:u.maxHp,state:u.state,team:u.team,type:u.type,pop:u.pop};
     gs._unitSnap[id]={x:u.x,z:u.z,hp:u.hp,state:u.state,tx:u.tx,tz:u.tz};
   }
-  // Include units that just died this tick (snap entry forced null above)
+  // Include units that just died and clean up all stale snap entries
   for(const id of Object.keys(gs._unitSnap)){
     if(gs._unitSnap[id]===null){
-      unitsDelta[id]={id,dead:true}; // minimal death notification
+      unitsDelta[id]={id,dead:true};
       delete gs._unitSnap[id];
     } else if(!units[id]){
+      // Unit is gone but snap wasn't nulled (edge case) — clean up silently
       delete gs._unitSnap[id];
     }
   }
+  // ─ Buildings delta — send dead:true for destroyed buildings, then delete them ─
   const bldsDelta={};
   for(const[id,b] of Object.entries(buildings)){
-    bldsDelta[id]={id:b.id,x:b.x,z:b.z,hp:b.hp,maxHp:b.maxHp,type:b.type,team:b.team,size:b.size,
-      productionQueue:b.productionQueue,dead:b.dead,
-      underConstruction:b.underConstruction,buildProgress:b.buildProgress,buildTime:b.buildTime};
+    if(b.dead){
+      bldsDelta[id]={id:b.id,dead:true}; // minimal death notification for client
+    } else {
+      bldsDelta[id]={id:b.id,x:b.x,z:b.z,hp:b.hp,maxHp:b.maxHp,type:b.type,team:b.team,size:b.size,
+        productionQueue:b.productionQueue,dead:false,
+        underConstruction:b.underConstruction,buildProgress:b.buildProgress,buildTime:b.buildTime,
+        rallyX:b.rallyX,rallyZ:b.rallyZ,rallyResourceId:b.rallyResourceId};
+    }
   }
+  // Now actually remove dead buildings from the map
+  for(const id in buildings)if(buildings[id].dead)delete buildings[id];
   // Resource nodes: only send amount delta each tick — static fields (x,z,type,maxAmount,isTree,variety)
   // were already sent on game start and never change.
   const resNodesDelta=gs.resNodes.filter(r=>!r.depleted).map(r=>({id:r.id,amount:r.amount}));
@@ -573,7 +610,8 @@ io.on('connection',socket=>{
     const lobby=lobbies[p.lobbyId];if(!lobby||lobby.status!=='playing')return;
     const gs=lobby.gs;const{units,buildings,teams}=gs;
 
-    if(cmd.type==='move'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;u.state='moving';u.tx=cmd.x;u.tz=cmd.z;u.target=null;}}
+    if(cmd.type==='setRally'){const b=buildings[cmd.buildingId];if(b&&b.ownerId===socket.id){b.rallyX=cmd.x;b.rallyZ=cmd.z;b.rallyResourceId=cmd.resourceId||null;}}
+    else if(cmd.type==='move'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;u.state='moving';u.tx=cmd.x;u.tz=cmd.z;u.target=null;}}
     else if(cmd.type==='stop'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;u.state='idle';u.target=null;}}
     else if(cmd.type==='attack'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;if(units[cmd.targetId]){u.state='attacking';u.target=cmd.targetId;}else if(buildings[cmd.targetId]){u.state='attacking_building';u.target=cmd.targetId;}}}
     else if(cmd.type==='resume_build'){
@@ -587,7 +625,7 @@ io.on('connection',socket=>{
         u.tx=b.x+(Math.random()-0.5)*b.size;u.tz=b.z+(Math.random()-0.5)*b.size;
       }
     }
-    else if(cmd.type==='gather'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id||u.type!=='Villager')continue;u.gatherTarget=cmd.resourceId;u.state='moving_to_gather';const rn=gs.resNodes.find(r=>r.id===cmd.resourceId);if(rn){u.tx=rn.x+(Math.random()-0.5);u.tz=rn.z+(Math.random()-0.5);}}}
+    else if(cmd.type==='gather'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id||u.type!=='Villager')continue;u.gatherTarget=cmd.resourceId;u.state='moving_to_gather';const rn=gs._resMap?gs._resMap.get(cmd.resourceId):gs.resNodes.find(r=>r.id===cmd.resourceId);if(rn){u.tx=rn.x+(Math.random()-0.5);u.tz=rn.z+(Math.random()-0.5);}}}
     else if(cmd.type==='build'){
       const t=teams[p.team],cost=BCOSTS[cmd.buildType];if(!cost)return;
       if(!afford(t,cost)){socket.emit('error',{message:'Not enough resources'});return;}

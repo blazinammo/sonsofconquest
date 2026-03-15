@@ -47,6 +47,11 @@ const envObjects = [];   // { mesh, x, z }
 // ── Selection ─────────────────────────────────────────────────
 let selectedUnitIds = [], selectedBuildingId = null, selectedResNodeId = null;
 
+// ── Rally point visuals ────────────────────────────────────────────────────
+// A dashed line from the building to its rally point + a flag marker
+let _rallyLine = null;   // THREE.Line
+let _rallyFlag = null;   // THREE.Mesh (flag marker at rally point)
+
 // ── Build ghost ───────────────────────────────────────────────
 let ghostState = null;
 
@@ -889,24 +894,48 @@ function initCamera(){
   document.addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false;});
   window.addEventListener('wheel',e=>{camDist=Math.max(10,Math.min(65,camDist+e.deltaY*0.04));});
 }
+// Smooth camera pan — velocity-based with friction so movement
+// accelerates on key-hold and decelerates on key-release with no lerp jitter.
+let _camVX=0,_camVZ=0;
 function tickCamera(dt){
-  const spd=18*dt;
+  const ACCEL=60, FRICTION=12, MAX_SPD=28;
   const rightX=Math.cos(camYaw),rightZ=-Math.sin(camYaw);
   const fwdX=Math.sin(camYaw),fwdZ=Math.cos(camYaw);
-  if(keys['arrowleft']||keys['a']){camTarget.x-=rightX*spd;camTarget.z-=rightZ*spd;}
-  if(keys['arrowright']||keys['d']){camTarget.x+=rightX*spd;camTarget.z+=rightZ*spd;}
-  if(keys['arrowup']||keys['w']){camTarget.x-=fwdX*spd;camTarget.z-=fwdZ*spd;}
-  if(keys['arrowdown']||keys['s']){camTarget.x+=fwdX*spd;camTarget.z+=fwdZ*spd;}
+
+  let ax=0,az=0;
+  if(keys['arrowleft'] ||keys['a']){ax-=rightX;az-=rightZ;}
+  if(keys['arrowright']||keys['d']){ax+=rightX;az+=rightZ;}
+  if(keys['arrowup']  ||keys['w']){ax-=fwdX;  az-=fwdZ;}
+  if(keys['arrowdown'] ||keys['s']){ax+=fwdX;  az+=fwdZ;}
+
+  const moving=ax!==0||az!==0;
+  if(moving){
+    _camVX+=ax*ACCEL*dt;
+    _camVZ+=az*ACCEL*dt;
+    // Clamp to max speed
+    const spd=Math.sqrt(_camVX*_camVX+_camVZ*_camVZ);
+    if(spd>MAX_SPD){_camVX=_camVX/spd*MAX_SPD;_camVZ=_camVZ/spd*MAX_SPD;}
+  } else {
+    // Friction — exponential decay, frame-rate independent
+    const decay=Math.exp(-FRICTION*dt);
+    _camVX*=decay;
+    _camVZ*=decay;
+    if(Math.abs(_camVX)<0.001)_camVX=0;
+    if(Math.abs(_camVZ)<0.001)_camVZ=0;
+  }
+
   if(keys['q'])camYaw-=dt*0.8;
   if(keys['e'])camYaw+=dt*0.8;
+
+  camTarget.x+=_camVX*dt;
+  camTarget.z+=_camVZ*dt;
   camTarget.x=Math.max(-HALF+5,Math.min(HALF-5,camTarget.x));
   camTarget.z=Math.max(-HALF+5,Math.min(HALF-5,camTarget.z));
-  const ix=camTarget.x+Math.sin(camYaw)*camDist;
-  const iz=camTarget.z+Math.cos(camYaw)*camDist;
-  const iy=camDist*0.88;
-  camera.position.x+=(ix-camera.position.x)*0.1;
-  camera.position.z+=(iz-camera.position.z)*0.1;
-  camera.position.y+=(iy-camera.position.y)*0.1;
+
+  // Place camera directly — no lerp, no lag, no jitter
+  camera.position.x=camTarget.x+Math.sin(camYaw)*camDist;
+  camera.position.z=camTarget.z+Math.cos(camYaw)*camDist;
+  camera.position.y=camDist*0.88;
   camera.lookAt(camTarget.x,0,camTarget.z);
 }
 
@@ -1015,7 +1044,32 @@ function handleDragSel(s,e2){
 }
 
 function handleRMB(e){
-  if(!gameStarted||selectedUnitIds.length===0)return;
+  if(!gameStarted)return;
+
+  // ── Rally point: RMB anywhere on ground while a building is selected ─────
+  if(selectedBuildingId&&selectedUnitIds.length===0){
+    const b=serverBuildings[selectedBuildingId];
+    if(b&&b.team===myTeam){
+      const wp=getWorldClick(e);if(!wp)return;
+      // Check if RMB landed on a visible resource node
+      let rnId=null;
+      for(const rn of serverResNodes){
+        if(rn.amount<=0)continue;
+        const mesh=resNodeMeshes[rn.id];
+        if(!mesh||!mesh.visible)continue;
+        if(Math.sqrt((rn.x-wp.x)**2+(rn.z-wp.z)**2)<(rn.type==='wood'?1.8:2.2)){rnId=rn.id;break;}
+      }
+      socket.emit('cmd',{type:'setRally',buildingId:selectedBuildingId,x:wp.x,z:wp.z,resourceId:rnId});
+      // Optimistically update local copy so the line redraws immediately
+      const lb=serverBuildings[selectedBuildingId];
+      if(lb){lb.rallyX=wp.x;lb.rallyZ=wp.z;lb.rallyResourceId=rnId;}
+      drawRallyIndicator(selectedBuildingId);
+      spawnClickMark(wp.x,wp.z);
+      return;
+    }
+  }
+
+  if(selectedUnitIds.length===0)return;
   const wp=getWorldClick(e);if(!wp)return;
   const tx=wp.x,tz=wp.z;
 
@@ -1074,6 +1128,7 @@ function deselAll(){
   selectedUnitIds=[];
   if(selectedBuildingId){const m=buildingMeshes[selectedBuildingId];if(m&&m.userData.selRing)m.userData.selRing.visible=false;selectedBuildingId=null;}
   selectedResNodeId=null;
+  clearRallyIndicator();
   refreshSelUI();
 }
 function selUnit(id){
@@ -1086,7 +1141,55 @@ function selUnit(id){
 function selBuilding(id){
   deselAll();selectedBuildingId=id;
   const m=buildingMeshes[id];if(m&&m.userData.selRing)m.userData.selRing.visible=true;
+  drawRallyIndicator(id);
   refreshSelUI();
+}
+
+// =================================================================
+//  RALLY POINT INDICATOR
+// =================================================================
+function clearRallyIndicator(){
+  if(_rallyLine){scene.remove(_rallyLine);_rallyLine.geometry.dispose();_rallyLine=null;}
+  if(_rallyFlag){scene.remove(_rallyFlag);_rallyFlag=null;}
+}
+function drawRallyIndicator(buildingId){
+  clearRallyIndicator();
+  const b=serverBuildings[buildingId];
+  if(!b||b.rallyX===null||b.rallyZ===null) return;
+  if(b.team!==myTeam) return;
+
+  const bx=b.x, by=getHeight(b.x,b.z)+0.3, bz=b.z;
+  const rx=b.rallyX, ry=getHeight(b.rallyX,b.rallyZ)+0.3, rz=b.rallyZ;
+
+  // Colour: yellow for move rally, green for resource rally
+  const isResourceRally=b.rallyResourceId!=null;
+  const rallyColor=isResourceRally?0x44dd88:0xffdd44;
+
+  // Dashed line — alternating segments between building and rally point
+  const points=[];
+  const SEGS=20;
+  for(let i=0;i<=SEGS;i++){
+    const t=i/SEGS;
+    // Skip every other segment to create dashes
+    if(Math.floor(i/2)*2!==i&&i>0) continue;
+    points.push(new THREE.Vector3(bx+(rx-bx)*t, by+(ry-by)*t, bz+(rz-bz)*t));
+    if(i<SEGS){
+      const t2=Math.min(1,(i+0.7)/SEGS);
+      points.push(new THREE.Vector3(bx+(rx-bx)*t2, by+(ry-by)*t2, bz+(rz-bz)*t2));
+    }
+  }
+  const lineGeo=new THREE.BufferGeometry().setFromPoints(points);
+  const lineMat=new THREE.LineBasicMaterial({color:rallyColor,transparent:true,opacity:0.85,depthTest:false});
+  _rallyLine=new THREE.LineSegments(lineGeo,lineMat);
+  scene.add(_rallyLine);
+
+  // Small flag/diamond marker at rally point
+  const flagGeo=new THREE.ConeGeometry(0.35,0.7,4);
+  const flagMat=new THREE.MeshBasicMaterial({color:rallyColor,transparent:true,opacity:0.9,depthTest:false});
+  _rallyFlag=new THREE.Mesh(flagGeo,flagMat);
+  _rallyFlag.position.set(rx,ry+0.35,rz);
+  _rallyFlag.rotation.y=Math.PI/4;
+  scene.add(_rallyFlag);
 }
 
 // =================================================================
@@ -1191,36 +1294,48 @@ function syncGameState(state){
   interpT=0;
 
   // ─ Buildings ─
-  const newBldIds=new Set(Object.keys(buildings));
+  // Merge delta into serverBuildings; handle dead:true as an explicit removal signal
+  for(const id in buildings){
+    const b=buildings[id];
+    if(b.dead){
+      // Building was destroyed this tick — fire death effect and remove mesh
+      if(buildingMeshes[id]){
+        spawnDeathFX(buildingMeshes[id].position,serverBuildings[id]?.team||1);
+        scene.remove(buildingMeshes[id]);delete buildingMeshes[id];
+        if(selectedBuildingId===id){selectedBuildingId=null;refreshSelUI();}
+      }
+      delete serverBuildings[id];
+    } else {
+      // Live building — update serverBuildings and sync mesh
+      serverBuildings[id]=b;
+      if(!buildingMeshes[id])spawnBuildingMesh(b);
+      const mesh=buildingMeshes[id];if(!mesh)continue;
+      // Construction animation
+      if(b.underConstruction&&b.buildTime>0){
+        const pct=Math.max(0.02,b.buildProgress/b.buildTime);
+        if(mesh.userData.scaffold){
+          mesh.userData.scaffold.scale.y=pct;
+          const scafH=mesh.userData.scafH||3;
+          mesh.userData.scaffold.position.y=(scafH/2)*pct;
+        }
+      } else if(!b.underConstruction&&mesh.userData.scaffold&&mesh.userData.scaffold.visible){
+        mesh.userData.scaffold.visible=false;
+        mesh.traverse(c=>{if(c.isMesh&&c.material&&c.material.opacity<1){c.material.opacity=1;c.material.transparent=false;}});
+      }
+      const hpFg=mesh.userData.hpFg;
+      if(hpFg){const pct=b.hp/b.maxHp;hpFg.scale.x=Math.max(0.01,pct);hpFg.position.x=-(mesh.userData.hpFgWidth/2)*(1-pct);hpFg.material.color.set(b.underConstruction?0xd4a84b:pct>0.6?0x4cdd4c:pct>0.3?0xffaa20:0xee3030);if(!b.underConstruction&&pct<0.4&&Math.random()<0.02)spawnSmoke(mesh.position);}
+      // Redraw rally indicator if this is the selected building and rally changed
+      if(id===selectedBuildingId) drawRallyIndicator(id);
+    }
+  }
+  // Remove meshes for any building the server no longer tracks at all
+  // (handles edge cases like joining mid-game after a building was already gone)
   for(const id in buildingMeshes){
-    if(!newBldIds.has(id)){
-      spawnDeathFX(buildingMeshes[id].position,serverBuildings[id]?.team||1);
+    if(!serverBuildings[id]){
       scene.remove(buildingMeshes[id]);delete buildingMeshes[id];
       if(selectedBuildingId===id){selectedBuildingId=null;refreshSelUI();}
     }
   }
-  for(const id in buildings){
-    const b=buildings[id];
-    if(!buildingMeshes[id])spawnBuildingMesh(b);
-    const mesh=buildingMeshes[id];if(!mesh)continue;
-    // Construction animation: grow scaffold upward as buildProgress advances
-    if(b.underConstruction&&b.buildTime>0){
-      const pct=Math.max(0.02,b.buildProgress/b.buildTime);
-      if(mesh.userData.scaffold){
-        mesh.userData.scaffold.scale.y=pct;
-        // Reposition so scaffold grows from ground up
-        const scafH=mesh.userData.scafH||3;
-        mesh.userData.scaffold.position.y=(scafH/2)*pct;
-      }
-    } else if(!b.underConstruction&&mesh.userData.scaffold&&mesh.userData.scaffold.visible){
-      // Construction just finished — remove scaffold, restore full opacity
-      mesh.userData.scaffold.visible=false;
-      mesh.traverse(c=>{if(c.isMesh&&c.material&&c.material.opacity<1){c.material.opacity=1;c.material.transparent=false;}});
-    }
-    const hpFg=mesh.userData.hpFg;
-    if(hpFg){const pct=b.hp/b.maxHp;hpFg.scale.x=Math.max(0.01,pct);hpFg.position.x=-(mesh.userData.hpFgWidth/2)*(1-pct);hpFg.material.color.set(b.underConstruction?0xd4a84b:pct>0.6?0x4cdd4c:pct>0.3?0xffaa20:0xee3030);if(!b.underConstruction&&pct<0.4&&Math.random()<0.02)spawnSmoke(mesh.position);}
-  }
-  serverBuildings=buildings;
 
   // ─ Projectiles ─
   const activeProjIds=new Set((projPool||[]).map(p=>p.id).filter(Boolean));
