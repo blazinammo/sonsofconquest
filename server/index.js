@@ -427,7 +427,14 @@ function gameTick(lobby){
   if(b1&&b1.dead){endGame(lobby,2);return;}
   if(b2&&b2.dead){endGame(lobby,1);return;}
 
-  // ─ Prune dead ─
+  // ─ Prune dead — include dead units in this tick's delta so clients remove them ─
+  if(!gs._unitSnap) gs._unitSnap={};
+  for(const id in units){
+    if(units[id].dead){
+      // Force into delta so client sees the death
+      gs._unitSnap[id]=null; // null forces re-send
+    }
+  }
   for(const id in units)if(units[id].dead)delete units[id];
   gs.projPool=gs.projPool.filter(p=>p.life>0).map(p=>({...p,life:p.life-dt,maxLife:p.maxLife}));
 
@@ -443,9 +450,14 @@ function gameTick(lobby){
     unitsDelta[id]={id:u.id,x:u.x,z:u.z,tx:u.tx,tz:u.tz,hp:u.hp,maxHp:u.maxHp,state:u.state,team:u.team,type:u.type,pop:u.pop};
     gs._unitSnap[id]={x:u.x,z:u.z,hp:u.hp,state:u.state,tx:u.tx,tz:u.tz};
   }
-  // Always include dead-unit removals (missing from units means dead)
+  // Include units that just died this tick (snap entry forced null above)
   for(const id of Object.keys(gs._unitSnap)){
-    if(!units[id]) delete gs._unitSnap[id];
+    if(gs._unitSnap[id]===null){
+      unitsDelta[id]={id,dead:true}; // minimal death notification
+      delete gs._unitSnap[id];
+    } else if(!units[id]){
+      delete gs._unitSnap[id];
+    }
   }
   const bldsDelta={};
   for(const[id,b] of Object.entries(buildings)){

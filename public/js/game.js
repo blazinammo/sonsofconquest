@@ -1138,24 +1138,46 @@ function syncGameState(state){
   }
 
   // ─ Units ─
-  const newUnitIds=new Set(Object.keys(units));
+  // Step 1: merge sparse delta into serverUnits FIRST so serverUnits is always
+  // the full live picture. Delta only contains units that changed this tick.
+  for(const id in units) serverUnits[id]=units[id];
+
+  // Step 2: death detection — server stops sending a unit when it dies.
+  // The server also prunes dead units from its own map, so after a few ticks
+  // a dead unit simply disappears from every delta. We detect death by tracking
+  // which ids the server has ever acknowledged; once absent from several consecutive
+  // deltas we consider it dead. Simple approach: server sends explicit dead flag
+  // OR unit vanishes from delta AND has no mesh yet — but the safest approach
+  // is to only remove meshes for units the server explicitly marks dead (dead:true)
+  // OR that have been absent from ALL deltas for >1s (stale).
+  // Since our delta skips unchanged units, we can't use "absent = dead".
+  // Instead: server sets unit.dead=true in the delta when a unit dies this tick,
+  // and we check for that here.
   for(const id in unitMeshes){
-    if(!newUnitIds.has(id)){
-      if(buildingMeshes[id])return;
-      spawnDeathFX(unitMeshes[id].position,serverUnits[id]?.team||1);
+    const u=serverUnits[id];
+    // Remove mesh if unit is explicitly dead OR no longer tracked at all
+    if(!u||u.dead===true){
+      if(buildingMeshes[id])continue;
+      spawnDeathFX(unitMeshes[id].position,u?.team||serverUnits[id]?.team||1);
       scene.remove(unitMeshes[id]);delete unitMeshes[id];
       delete interpFrom[id];delete interpTo[id];
+      delete serverUnits[id];
       selectedUnitIds=selectedUnitIds.filter(x=>x!==id);
     }
   }
-  for(const id in units){
-    const u=units[id];
+
+  // Step 3: spawn meshes for any unit we know about but haven't rendered yet
+  for(const id in serverUnits){
+    const u=serverUnits[id];
+    if(!u||u.dead)continue;
     if(!unitMeshes[id]){
       spawnUnitMesh(u);
       const mesh=unitMeshes[id];
       if(mesh){mesh.position.x=u.x;mesh.position.z=u.z;mesh.position.y=getHeight(u.x,u.z);}
       interpFrom[id]={x:u.x,z:u.z};interpTo[id]={x:u.x,z:u.z};continue;
     }
+    // Step 4: update interpolation targets for units that changed this tick
+    if(!units[id]) continue; // not in delta this tick — skip, keep last interp target
     const mesh=unitMeshes[id];
     interpFrom[id]={x:mesh.position.x,z:mesh.position.z};
     interpTo[id]={x:u.x,z:u.z};
@@ -1167,14 +1189,6 @@ function syncGameState(state){
     }
   }
   interpT=0;
-  // Merge sparse unit delta into serverUnits
-  // Any id present in delta overwrites; ids present in serverUnits but absent from
-  // delta are unchanged (still alive, just didn't move this tick).
-  for(const id in units) serverUnits[id]=units[id];
-  // Remove units that have been pruned server-side (no longer in any delta)
-  // We detect this via the dead-unit removal: server stops sending dead units.
-  // Use newUnitIds (computed above) as the authoritative alive set.
-  for(const id in serverUnits){if(!newUnitIds.has(id))delete serverUnits[id];}
 
   // ─ Buildings ─
   const newBldIds=new Set(Object.keys(buildings));
@@ -1630,6 +1644,7 @@ socket.on('lobbyJoined',({lobbyId,team,isHost:ih,players,mapData,initialState})=
   if(mapData){
     terrHeights=mapData.heights;P_OX=mapData.pox;P_OZ=mapData.poz;AI_OX=mapData.aox;AI_OZ=mapData.aoz;
     if(initialState){serverUnits=initialState.units||{};serverBuildings=initialState.buildings||{};serverTeams=initialState.teams||{};}
+    if(mapData.resNodes)serverResNodes=mapData.resNodes;
   }
   updateRoomUI(players,team,ih);
   showScreen('screen-room');
@@ -1724,7 +1739,8 @@ socket.on('gameStarted',({units,buildings,teams,mapData,team})=>{
     const buf=Uint8Array.from(atob(mapData.heightsB64),c=>c.charCodeAt(0)).buffer;
     mapData.heights=Array.from(new Float32Array(buf));
   }
-  if(mapData){terrHeights=mapData.heights;P_OX=mapData.pox;P_OZ=mapData.poz;AI_OX=mapData.aox;AI_OZ=mapData.aoz;}
+  if(mapData){terrHeights=mapData.heights;P_OX=mapData.pox;P_OZ=mapData.poz;AI_OX=mapData.aox;AI_OZ=mapData.aoz;
+    if(mapData.resNodes)serverResNodes=mapData.resNodes;}
   startGameClient();
 });
 
