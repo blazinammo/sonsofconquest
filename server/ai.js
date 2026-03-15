@@ -84,10 +84,11 @@ const DIFF_CFG = {
     researchList:    ['Iron Tools','Loom','Feudal Age','Horse Collar','Scale Armor'],
   },
   hard: {
-    maxVillagers:    13,
-    maxArmy:         25,
+    maxVillagers:    90,
+    maxArmy:         70,
     attackInterval:  180,   // 3 min — attacks early and often
-    attackThreshold: 5,     // attacks with just 5 units (doesn't wait long)
+    attackWaveSizes: [5,15,20,30,55], // cycles through these wave sizes
+    attackThreshold: 5,     // minimum to trigger (first wave)
     buildInterval:   12,
     trainInterval:   6,
     researchEnabled: true,
@@ -96,7 +97,7 @@ const DIFF_CFG = {
                       'House','Barracks','House','Tower','House','Barracks',
                       'House','Farm','House','Castle'],
     trainTypes:      ['Swordsman','Archer','Knight','Scout'],
-    gatherRadius:    50,
+    gatherRadius:    100,
     unitPreference:  'strongest',  // picks best affordable unit
     researchList:    ['Iron Tools','Loom','Masonry','Feudal Age','Fletching',
                       'Scale Armor','Horse Collar','Castle Age','Chemistry','Plate Armor'],
@@ -178,7 +179,8 @@ function tickAI(lobby, dt, teamNum, difficulty, ctx) {
 
     // Find the closest non-depleted resource node within gather radius
     let best=null, bd=cfg.gatherRadius;
-    for(const rn of resNodes){
+    const nodeList=ctx.resMap?[...ctx.resMap.values()]:resNodes;
+    for(const rn of nodeList){
       if(rn.depleted||rn.amount<=0) continue;
       const d=_dist2D(v.x,v.z,rn.x,rn.z);
       if(d<bd){ bd=d; best=rn; }
@@ -360,21 +362,31 @@ function tickAI(lobby, dt, teamNum, difficulty, ctx) {
   const tx = target ? target.x : 0;
   const tz = target ? target.z : 0;
 
+  // For hard AI, determine the current wave size target from the cycling list
+  let currentThreshold = cfg.attackThreshold;
+  if(cfg.attackWaveSizes){
+    if(!ai.waveIndex) ai.waveIndex=0;
+    currentThreshold = cfg.attackWaveSizes[ai.waveIndex % cfg.attackWaveSizes.length];
+  }
+
   const shouldAttack =
-    readyArmy.length >= cfg.attackThreshold &&
+    readyArmy.length >= currentThreshold &&
     ai.attackTimer >= cfg.attackInterval &&
-    gs.gameTime >= cfg.attackInterval * 0.4; // don't attack in first 40% of attack interval
+    gs.gameTime >= cfg.attackInterval * 0.4;
 
   if(shouldAttack){
     ai.isAttacking = true;
     ai.attackTimer = 0;
+    // Advance to next wave size for next attack
+    if(cfg.attackWaveSizes) ai.waveIndex = ((ai.waveIndex||0)+1) % cfg.attackWaveSizes.length;
+    // Only send up to currentThreshold units in this wave — hold the rest back
+    const wave = readyArmy.slice(0, currentThreshold);
     gs.events.push({
-      msg:`⚔ Enemy assault! ${readyArmy.length} warriors marching!`,
+      msg:`⚔ Enemy assault! ${wave.length} warriors marching!`,
       type:'bad'
     });
-    for(const id of readyArmy){
+    for(const id of wave){
       const u = units[id]; if(!u) continue;
-      // Spread out slightly around target so they don't all pile on one cell
       let ax = tx+(Math.random()-0.5)*10, az = tz+(Math.random()-0.5)*10;
       if(iW(ax,az)){ ax=tx; az=tz; }
       u.tx=ax; u.tz=az; u.state='moving_to_attack';

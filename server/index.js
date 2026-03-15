@@ -427,11 +427,17 @@ function gameTick(lobby){
   if(gs.incomeTimer>=5){
     gs.incomeTimer=0;
     for(const t of[1,2]){
-      const farms=Object.values(buildings).filter(b=>!b.dead&&!b.underConstruction&&b.team===t&&b.type==='Farm').length;
-      const lumber=Object.values(buildings).filter(b=>!b.dead&&!b.underConstruction&&b.team===t&&b.type==='Lumbercamp').length;
       const fa=(teams[t].researched||[]).includes('Horse Collar')?12:8;
-      teams[t].food=Math.min(9999,teams[t].food+farms*fa);
-      teams[t].wood=Math.min(9999,teams[t].wood+lumber*5);
+      for(const b of Object.values(buildings)){
+        if(b.dead||b.underConstruction||b.team!==t) continue;
+        if(b.type==='Farm'){
+          teams[t].food=Math.min(9999,(teams[t].food||0)+fa);
+          gs.events.push({type:'farm_income',res:'food',amt:fa,x:b.x,z:b.z,team:t});
+        } else if(b.type==='Lumbercamp'){
+          teams[t].wood=Math.min(9999,(teams[t].wood||0)+5);
+          gs.events.push({type:'farm_income',res:'wood',amt:5,x:b.x,z:b.z,team:t});
+        }
+      }
     }
   }
 

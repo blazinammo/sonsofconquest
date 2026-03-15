@@ -983,8 +983,16 @@ function setupMouse(){
   canvas.addEventListener('contextmenu',e=>e.preventDefault());
   document.getElementById('minimap').addEventListener('click',e=>{
     const r=e.target.getBoundingClientRect();
-    camTarget.x=((e.clientX-r.left)/150)*MAP-HALF;
-    camTarget.z=((e.clientY-r.top)/118)*MAP-HALF;
+    const wx=((e.clientX-r.left)/150)*MAP-HALF;
+    const wz=((e.clientY-r.top)/118)*MAP-HALF;
+    // If units are selected, issue a move command to the clicked world position
+    if(gameStarted&&selectedUnitIds.length>0){
+      socket.emit('cmd',{type:'move',unitIds:selectedUnitIds,x:wx,z:wz});
+      spawnClickMark(wx,wz);
+    }
+    // Always pan the camera to the clicked location
+    camTarget.x=wx;
+    camTarget.z=wz;
   });
 }
 
@@ -1354,6 +1362,7 @@ function syncGameState(state){
   // ─ Events ─
   if(events)for(const ev of events){
     if(ev.type==='gather'&&ev.team===myTeam){spawnResGainPopupFromTeam(ev.carry);}
+    else if(ev.type==='farm_income'&&ev.team===myTeam){spawnResGainPopupAtWorld({[ev.res]:ev.amt},ev.x,ev.z);}
     else if(ev.msg)logEv(ev.msg,ev.type||'info');
     else if(ev.type==='trained'&&ev.team===myTeam)alert2(`${ev.unitType} ready!`);
     else if(ev.type==='combat'){}
@@ -1605,10 +1614,25 @@ const RES_COLORS={food:'#7ddd50',wood:'#c8a050',gold:'#ffd700',stone:'#b0a898'};
 const RES_ICONS={food:'🌾',wood:'🪵',gold:'💰',stone:'🪨'};
 function spawnResGainPopupFromTeam(carry){
   if(!carry)return;
+  spawnResGainPopup(carry, innerWidth/2+Math.random()*100-50, innerHeight*0.3+Math.random()*60);
+}
+function spawnResGainPopupAtWorld(carry, wx, wz){
+  if(!carry||!camera)return;
+  // Project world position to screen space
+  const v=new THREE.Vector3(wx, getHeight(wx,wz)+3, wz);
+  v.project(camera);
+  const sx=(v.x+1)/2*innerWidth;
+  const sy=(-v.y+1)/2*innerHeight;
+  // Only show if in front of camera (z<1) and roughly on screen
+  if(v.z>1||sx<-60||sx>innerWidth+60||sy<-60||sy>innerHeight+60) return;
+  spawnResGainPopup(carry, sx, sy);
+}
+function spawnResGainPopup(carry, screenX, screenY){
+  if(!carry)return;
   const parts=Object.entries(carry).filter(([,v])=>v>0);if(!parts.length)return;
   const label=document.createElement('div');label.className='res-popup';
-  label.style.left=(innerWidth/2+Math.random()*100-50)+'px';
-  label.style.top=(innerHeight*0.3+Math.random()*60)+'px';
+  label.style.left=screenX+'px';
+  label.style.top=screenY+'px';
   label.style.transform='translate(-50%,-50%)';
   label.innerHTML=parts.map(([res,amt])=>`<span style="color:${RES_COLORS[res]||'#fff'}">${RES_ICONS[res]||''}+${Math.floor(amt)}</span>`).join(' ');
   document.body.appendChild(label);
