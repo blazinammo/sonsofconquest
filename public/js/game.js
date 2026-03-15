@@ -224,14 +224,28 @@ function tickFOW(dt){
       if(fowVis[i]>0.5) fowVis[i]=0.5;
     }
   }
-  // Reveal from my units — use interpolated mesh position so the
-  // revealed circle is always centred on where the unit visually appears
+  // Reveal from my units — project the unit's elevated 3D position along the
+  // camera ray to y=0 so the FOW circle is always visually centred on the unit
+  // even when it stands on high terrain.
   for(const id in serverUnits){
     const u=serverUnits[id];
     if(u.team!==myTeam) continue;
     const mesh=unitMeshes[id];
-    const rx=mesh?mesh.position.x:u.x;
-    const rz=mesh?mesh.position.z:u.z;
+    let rx=u.x, rz=u.z;
+    if(mesh && camera){
+      // Ray from camera through the unit's 3D mesh position, intersected with y=0
+      const mx=mesh.position.x, my=mesh.position.y, mz=mesh.position.z;
+      const cx=camera.position.x, cy=camera.position.y, cz=camera.position.z;
+      const dx=mx-cx, dy=my-cy, dz=mz-cz;
+      // t such that (cy + dy*t) = 0  →  t = -cy/dy
+      if(Math.abs(dy)>0.001){
+        const t=-cy/dy;
+        rx=cx+dx*t;
+        rz=cz+dz*t;
+      } else {
+        rx=mx; rz=mz;
+      }
+    }
     fowReveal(rx,rz,u.vision||7);
   }
   // Reveal from my buildings
@@ -1090,8 +1104,24 @@ function syncGameState(state){
   updateResUI(myT);
   updateAIPanel(enemyT);
 
-  // ─ Resource nodes ─
-  serverResNodes=resNodes||[];
+  // ─ Resource nodes delta — server now sends only {id,amount} each tick.
+  // Merge into serverResNodes; static fields (x,z,type,maxAmount,isTree,variety)
+  // were set once on game start and are preserved here.
+  if(resNodes&&resNodes.length>0){
+    if(resNodes[0].x!==undefined){
+      // Full node data (game start) — replace entirely
+      serverResNodes=resNodes;
+    } else {
+      // Delta — only amount changed, update in place
+      const deltaMap={};for(const d of resNodes) deltaMap[d.id]=d.amount;
+      serverResNodes=serverResNodes.filter(r=>{
+        if(deltaMap[r.id]!==undefined){r.amount=deltaMap[r.id];return true;}
+        return false; // depleted (not in delta) — remove
+      });
+    }
+  } else if(resNodes&&resNodes.length===0){
+    serverResNodes=[];
+  }
   if(selectedResNodeId&&!serverResNodes.find(r=>r.id===selectedResNodeId)){selectedResNodeId=null;refreshSelUI();}
   for(const rn of serverResNodes){
     if(!resNodeMeshes[rn.id])makeResNodeMesh(rn);
@@ -1137,7 +1167,14 @@ function syncGameState(state){
     }
   }
   interpT=0;
-  serverUnits=units;
+  // Merge sparse unit delta into serverUnits
+  // Any id present in delta overwrites; ids present in serverUnits but absent from
+  // delta are unchanged (still alive, just didn't move this tick).
+  for(const id in units) serverUnits[id]=units[id];
+  // Remove units that have been pruned server-side (no longer in any delta)
+  // We detect this via the dead-unit removal: server stops sending dead units.
+  // Use newUnitIds (computed above) as the authoritative alive set.
+  for(const id in serverUnits){if(!newUnitIds.has(id))delete serverUnits[id];}
 
   // ─ Buildings ─
   const newBldIds=new Set(Object.keys(buildings));
@@ -1585,6 +1622,10 @@ window.joinLobby=function(id){socket.emit('joinLobby',{lobbyId:id,team:1});};
 
 socket.on('lobbyJoined',({lobbyId,team,isHost:ih,players,mapData,initialState})=>{
   currentLobbyId=lobbyId;myTeam=Number(team);isHost=ih;
+  if(mapData&&mapData.heightsB64&&!mapData.heights){
+    const buf=Uint8Array.from(atob(mapData.heightsB64),c=>c.charCodeAt(0)).buffer;
+    mapData.heights=Array.from(new Float32Array(buf));
+  }
   const rc=document.getElementById('room-code-display');if(rc)rc.textContent=lobbyId;
   if(mapData){
     terrHeights=mapData.heights;P_OX=mapData.pox;P_OZ=mapData.poz;AI_OX=mapData.aox;AI_OZ=mapData.aoz;
@@ -1679,6 +1720,10 @@ function removeAI(teamNum){
 socket.on('gameStarted',({units,buildings,teams,mapData,team})=>{
   serverUnits=units;serverBuildings=buildings;serverTeams=teams;
   if(team!=null) myTeam=Number(team);
+  if(mapData&&mapData.heightsB64&&!mapData.heights){
+    const buf=Uint8Array.from(atob(mapData.heightsB64),c=>c.charCodeAt(0)).buffer;
+    mapData.heights=Array.from(new Float32Array(buf));
+  }
   if(mapData){terrHeights=mapData.heights;P_OX=mapData.pox;P_OZ=mapData.poz;AI_OX=mapData.aox;AI_OZ=mapData.aoz;}
   startGameClient();
 });

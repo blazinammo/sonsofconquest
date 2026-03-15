@@ -432,8 +432,20 @@ function gameTick(lobby){
   gs.projPool=gs.projPool.filter(p=>p.life>0).map(p=>({...p,life:p.life-dt,maxLife:p.maxLife}));
 
   const unitsDelta={};
+  if(!gs._unitSnap) gs._unitSnap={};
   for(const[id,u] of Object.entries(units)){
+    const snap=gs._unitSnap[id];
+    // Only include unit if any tracked field has changed since last tick
+    if(snap&&Math.abs(snap.x-u.x)<0.001&&Math.abs(snap.z-u.z)<0.001
+        &&snap.hp===u.hp&&snap.state===u.state&&snap.tx===u.tx&&snap.tz===u.tz){
+      continue; // unchanged — skip it this tick
+    }
     unitsDelta[id]={id:u.id,x:u.x,z:u.z,tx:u.tx,tz:u.tz,hp:u.hp,maxHp:u.maxHp,state:u.state,team:u.team,type:u.type,pop:u.pop};
+    gs._unitSnap[id]={x:u.x,z:u.z,hp:u.hp,state:u.state,tx:u.tx,tz:u.tz};
+  }
+  // Always include dead-unit removals (missing from units means dead)
+  for(const id of Object.keys(gs._unitSnap)){
+    if(!units[id]) delete gs._unitSnap[id];
   }
   const bldsDelta={};
   for(const[id,b] of Object.entries(buildings)){
@@ -441,8 +453,11 @@ function gameTick(lobby){
       productionQueue:b.productionQueue,dead:b.dead,
       underConstruction:b.underConstruction,buildProgress:b.buildProgress,buildTime:b.buildTime};
   }
+  // Resource nodes: only send amount delta each tick — static fields (x,z,type,maxAmount,isTree,variety)
+  // were already sent on game start and never change.
+  const resNodesDelta=gs.resNodes.filter(r=>!r.depleted).map(r=>({id:r.id,amount:r.amount}));
   io.to(lobby.id).emit('gameState',{
-    units:unitsDelta,buildings:bldsDelta,teams,resNodes:gs.resNodes.filter(r=>!r.depleted),
+    units:unitsDelta,buildings:bldsDelta,teams,resNodes:resNodesDelta,
     projPool:gs.projPool,events:gs.events.splice(0),gameTime:gs.gameTime
   });
 }
@@ -499,8 +514,10 @@ io.on('connection',socket=>{
     if(p.lobbyId){const ol=lobbies[p.lobbyId];if(ol)delete ol.players[socket.id];socket.leave(p.lobbyId);}
     p.lobbyId=lobby.id;p.team=assignedTeam;lobby.players[socket.id]=p;socket.join(lobby.id);
     const gs=lobby.gs;
+    const f32h2=new Float32Array(gs.heights);
+    const hB64=Buffer.from(f32h2.buffer).toString('base64');
     socket.emit('lobbyJoined',{lobbyId:lobby.id,team:p.team,isHost:lobby.hostId===socket.id,players:getLobbyPlayers(lobby),
-      mapData:{heights:Array.from(gs.heights),resNodes:gs.resNodes,pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz},
+      mapData:{heightsB64:hB64,resNodes:gs.resNodes,pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz},
       initialState:{units:gs.units,buildings:gs.buildings,teams:gs.teams}});
     io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby)});
   });
@@ -527,10 +544,13 @@ io.on('connection',socket=>{
       if(teamToSocket[b.team]) b.ownerId=teamToSocket[b.team];
       else if(lobby.aiPlayers[b.team]) b.ownerId='ai_team_'+b.team;
     }
+    // Encode height array as base64 Float32 — ~33KB instead of ~89KB as JSON
+    const f32h=new Float32Array(gs.heights);
+    const heightsB64=Buffer.from(f32h.buffer).toString('base64');
     for(const[sid,pl] of Object.entries(lobby.players)){
       io.to(sid).emit('gameStarted',{
         units:gs.units,buildings:gs.buildings,teams:gs.teams,team:pl.team,
-        mapData:{heights:Array.from(gs.heights),resNodes:gs.resNodes,pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz}
+        mapData:{heightsB64,resNodes:gs.resNodes,pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz}
       });
     }
     lobby.tickInterval=setInterval(()=>gameTick(lobby),TICK);
