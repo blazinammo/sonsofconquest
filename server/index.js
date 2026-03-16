@@ -831,7 +831,7 @@ io.on('connection',socket=>{
       if(cmd.techId==='Castle Age'){t.age=2;gs.events.push({msg:`Team ${p.team} advances to Castle Age!`,type:'good'});}
       if(cmd.techId==='Imperial Age'){t.age=3;gs.events.push({msg:`Team ${p.team} reaches Imperial Age!`,type:'good'});}
       if(cmd.techId==='Loom')for(const u of Object.values(units)){if(u.team===p.team&&u.type==='Villager'){u.maxHp+=40;u.hp=Math.min(u.hp+40,u.maxHp);}}
-      if(cmd.techId==='Masonry')for(const b of Object.values(buildings)){if(b.team===p.team){b.maxHp=Math.floor(b.maxHp*1.2);}}
+      if(cmd.techId==='Masonry')for(const b of Object.values(buildings)){if(b.team===p.team){const newMax=Math.floor(b.maxHp*1.2);b.hp=Math.min(newMax,Math.floor(b.hp*(newMax/b.maxHp)));b.maxHp=newMax;}}
       if(cmd.techId==='Scale Armor')for(const u of Object.values(units)){if(u.team===p.team)u.def+=2;}
       if(cmd.techId==='Plate Armor')for(const u of Object.values(units)){if(u.team===p.team)u.def+=4;}
       socket.emit('techResearched',{techId:cmd.techId,team:p.team});

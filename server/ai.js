@@ -309,7 +309,7 @@ function tickAI(lobby, dt, teamNum, difficulty, ctx){
         if(techId==='Feudal Age'){td.age=1;gs.events.push({msg:'Enemy advances to Feudal Age!',type:'warn'});}
         if(techId==='Castle Age'){td.age=2;gs.events.push({msg:'Enemy advances to Castle Age!',type:'warn'});}
         if(techId==='Loom') for(const u of Object.values(units)) if(u.team===teamNum&&u.type==='Villager'){u.maxHp+=40;u.hp=Math.min(u.hp+40,u.maxHp);}
-        if(techId==='Masonry') for(const b of Object.values(buildings)) if(b.team===teamNum) b.maxHp=Math.floor(b.maxHp*1.2);
+        if(techId==='Masonry') for(const b of Object.values(buildings)) if(b.team===teamNum){const newMax=Math.floor(b.maxHp*1.2);b.hp=Math.min(newMax,Math.floor(b.hp*(newMax/b.maxHp)));b.maxHp=newMax;}
         if(techId==='Scale Armor') for(const u of Object.values(units)) if(u.team===teamNum) u.def+=2;
         if(techId==='Plate Armor') for(const u of Object.values(units)) if(u.team===teamNum) u.def+=4;
         gs.events.push({msg:`Enemy researched ${techId}!`,type:'warn'});
