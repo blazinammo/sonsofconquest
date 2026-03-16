@@ -28,6 +28,10 @@ const unitMeshes = {}, buildingMeshes = {}, resNodeMeshes = {};
 // ── Snapshot interpolation ─────────────────────────────────────
 const interpFrom={},interpTo={};
 let interpT=0;
+const STATE_DEC={i:'idle',m:'moving',a:'attacking',ab:'attacking_building',
+  ma:'moving_to_attack',mb:'moving_to_build',b:'building',
+  mg:'moving_to_gather',g:'gathering',r:'returning',
+  f:'farming',mf:'moving_to_farm',am:'attack_move'};
 const INTERP_PERIOD=0.15;
 const projMeshes = [];
 const _clientProjs={};
@@ -1096,8 +1100,8 @@ function handleRMB(e){
         socket.emit('cmd',{type:'resume_build',unitIds:vids,buildingId:id});
         spawnClickMark(tx,tz);return;
       }
-      // Completed farm: assign villager to work it
-      if(!b.underConstruction&&b.type==='Farm'&&dist<(b.size||2.0)+1.5){
+      // Completed farm: assign villager to work it (only if no one farming yet)
+      if(!b.underConstruction&&b.type==='Farm'&&dist<(b.size||2.0)+2.5){
         socket.emit('cmd',{type:'farm_work',unitIds:vids,buildingId:id});
         spawnClickMark(tx,tz);return;
       }
@@ -1212,8 +1216,22 @@ function drawRallyIndicator(buildingId){
 //  GAME STATE SYNC
 // =================================================================
 function syncGameState(state){
-  const{units,buildings,teams,resNodes,projPool,events,gameTime:gt}=state;
-  gameTime=gt||gameTime;
+  // Decode short-key packet: {u,b,t,r,pe,ev}
+  const units=state.u||state.units||{};
+  const buildings=state.b||state.buildings||{};
+  const teamsRaw=state.t||state.teams||{};
+  const resNodes=state.r||state.resNodes||[];
+  const projPool=state.pe||state.projPool||[];
+  const events=state.ev||state.events||[];
+  // Expand teams short keys back to full names
+  const teams={};
+  for(const tn of[1,2]){
+    const t=teamsRaw[tn]||teamsRaw[String(tn)]||{};
+    teams[tn]={food:t.f??t.food??0,wood:t.w??t.wood??0,gold:t.g??t.gold??0,stone:t.s??t.stone??0,
+      population:t.p??t.population??0,maxPop:t.mp??t.maxPop??0,score:t.sc??t.score??0,
+      age:t.a??t.age??0,researched:t.re??t.researched??[]};
+  }
+  gameTime+=0.15; // client advances gameTime locally
 
   // ─ Teams ─
   serverTeams=teams||{};
@@ -1232,7 +1250,7 @@ function syncGameState(state){
       serverResNodes=resNodes;
     } else {
       // Delta — only amount; nodes absent from delta have been deleted on server
-      const deltaMap={};for(const d of resNodes) deltaMap[d.id]=d.amount;
+      const deltaMap={};for(const d of resNodes) deltaMap[d.id]=d.a!==undefined?d.a:d.amount;
       const surviving=[];
       for(const r of serverResNodes){
         if(deltaMap[r.id]!==undefined){
@@ -1266,23 +1284,31 @@ function syncGameState(state){
   }
 
   // ─ Units ─
-  // Step 1: merge sparse delta into serverUnits, PRESERVING static fields.
-  // The delta only contains slim fields (x,z,hp,state,etc). Fields like vision,
-  // atk, def, spd, rng are only sent on game start. Merge field-by-field so
-  // we never lose static data that isn't re-sent each tick.
+  // Step 1: merge sparse delta — decode short keys, preserve static fields
   for(const id in units){
-    const delta=units[id];
+    const d=units[id];
+    // Decode short keys to full names
+    const delta={...d};
+    if(d.s!==undefined) delta.state=STATE_DEC[d.s]||d.s;
+    if(d.tm!==undefined) delta.team=d.tm;
+    if(d.t!==undefined&&typeof d.t==='string') delta.type=d.t;
+    if(d.mh!==undefined) delta.maxHp=d.mh;
+    if(d.p!==undefined) delta.pop=d.p;
+
     if(delta.dead){
-      // Death signal — keep the dead flag but don't overwrite good data
       if(serverUnits[id]) serverUnits[id].dead=true;
       else serverUnits[id]=delta;
     } else if(serverUnits[id]){
-      // Merge only the fields present in the delta — preserve everything else
       const u=serverUnits[id];
-      u.x=delta.x;u.z=delta.z;u.tx=delta.tx;u.tz=delta.tz;
-      u.hp=delta.hp;u.maxHp=delta.maxHp;u.state=delta.state;u.pop=delta.pop;
+      if(delta.x!==undefined) u.x=delta.x;
+      if(delta.z!==undefined) u.z=delta.z;
+      if(delta.tx!==undefined) u.tx=delta.tx;
+      if(delta.tz!==undefined) u.tz=delta.tz;
+      if(delta.hp!==undefined) u.hp=delta.hp;
+      if(delta.maxHp!==undefined) u.maxHp=delta.maxHp;
+      if(delta.state!==undefined) u.state=delta.state;
+      if(delta.pop!==undefined) u.pop=delta.pop;
     } else {
-      // New unit not yet in serverUnits
       serverUnits[id]=delta;
     }
   }
@@ -1338,9 +1364,22 @@ function syncGameState(state){
   }
 
   // ─ Buildings ─
-  // Merge delta into serverBuildings; handle dead:true as an explicit removal signal
+  // Decode short keys and merge sparse delta into serverBuildings
   for(const id in buildings){
-    const b=buildings[id];
+    const raw=buildings[id];
+    // Expand short keys
+    const b={...raw};
+    if(raw.t!==undefined&&typeof raw.t==='string') b.type=raw.t;
+    if(raw.tm!==undefined) b.team=raw.tm;
+    if(raw.mh!==undefined) b.maxHp=raw.mh;
+    if(raw.sz!==undefined) b.size=raw.sz;
+    if(raw.pq!==undefined) b.productionQueue=raw.pq;
+    if(raw.uc!==undefined) b.underConstruction=raw.uc;
+    if(raw.bp!==undefined) b.buildProgress=raw.bp;
+    if(raw.bt!==undefined) b.buildTime=raw.bt;
+    if(raw.rx!==undefined) b.rallyX=raw.rx;
+    if(raw.rz!==undefined) b.rallyZ=raw.rz;
+    if(raw.ri!==undefined) b.rallyResourceId=raw.ri;
     if(b.dead){
       // Building was destroyed this tick — fire death effect and remove mesh
       if(buildingMeshes[id]){
@@ -1350,24 +1389,27 @@ function syncGameState(state){
       }
       delete serverBuildings[id];
     } else {
-      // Live building — update serverBuildings and sync mesh
-      serverBuildings[id]=b;
-      if(!buildingMeshes[id])spawnBuildingMesh(b);
+      // Live building — merge delta into existing entry (preserves static fields not in sparse delta),
+      // or store as new entry if we've never seen this building before.
+      if(serverBuildings[id]) Object.assign(serverBuildings[id],b);
+      else serverBuildings[id]=b;
+      const sb=serverBuildings[id];
+      if(!buildingMeshes[id])spawnBuildingMesh(sb);
       const mesh=buildingMeshes[id];if(!mesh)continue;
       // Construction animation
-      if(b.underConstruction&&b.buildTime>0){
-        const pct=Math.max(0.02,b.buildProgress/b.buildTime);
+      if(sb.underConstruction&&sb.buildTime>0){
+        const pct=Math.max(0.02,sb.buildProgress/sb.buildTime);
         if(mesh.userData.scaffold){
           mesh.userData.scaffold.scale.y=pct;
           const scafH=mesh.userData.scafH||3;
           mesh.userData.scaffold.position.y=(scafH/2)*pct;
         }
-      } else if(!b.underConstruction&&mesh.userData.scaffold&&mesh.userData.scaffold.visible){
+      } else if(!sb.underConstruction&&mesh.userData.scaffold&&mesh.userData.scaffold.visible){
         mesh.userData.scaffold.visible=false;
         mesh.traverse(c=>{if(c.isMesh&&c.material&&c.material.opacity<1){c.material.opacity=1;c.material.transparent=false;}});
       }
       const hpFg=mesh.userData.hpFg;
-      if(hpFg){const pct=b.hp/b.maxHp;hpFg.scale.x=Math.max(0.01,pct);hpFg.position.x=-(mesh.userData.hpFgWidth/2)*(1-pct);hpFg.material.color.set(b.underConstruction?0xd4a84b:pct>0.6?0x4cdd4c:pct>0.3?0xffaa20:0xee3030);if(!b.underConstruction&&pct<0.4&&Math.random()<0.02)spawnSmoke(mesh.position);}
+      if(hpFg){const pct=sb.hp/sb.maxHp;hpFg.scale.x=Math.max(0.01,pct);hpFg.position.x=-(mesh.userData.hpFgWidth/2)*(1-pct);hpFg.material.color.set(sb.underConstruction?0xd4a84b:pct>0.6?0x4cdd4c:pct>0.3?0xffaa20:0xee3030);if(!sb.underConstruction&&pct<0.4&&Math.random()<0.02)spawnSmoke(mesh.position);}
       // Redraw rally indicator if this is the selected building and rally changed
       if(id===selectedBuildingId) drawRallyIndicator(id);
     }
@@ -1381,17 +1423,14 @@ function syncGameState(state){
     }
   }
 
-  // ─ Projectiles ─
-  const activeProjIds=new Set((projPool||[]).map(p=>p.id).filter(Boolean));
-  for(const id in _clientProjs){
-    if(!activeProjIds.has(id)){if(_clientProjs[id].mesh)_clientProjs[id].mesh.visible=false;delete _clientProjs[id];}
-  }
+  // ─ Projectiles: spawn-event only — register new ones, client tracks lifetime ─
   if(projPool)for(const p of projPool){
     if(!p.id)continue;
+    const color=p.c!==undefined?p.c:p.color;
+    const ml=p.ml!==undefined?p.ml:p.maxLife||1.8;
     if(!_clientProjs[p.id]){
-      const mesh=_acquireProjMesh(p.color);
-      const elapsed=(p.maxLife||1.8)-p.life;
-      _clientProjs[p.id]={fx:p.fx,fy:p.fy||1,fz:p.fz,tx:p.tx,ty:p.ty||1,tz:p.tz,maxLife:p.maxLife||1.8,elapsed,mesh};
+      const mesh=_acquireProjMesh(color);
+      _clientProjs[p.id]={fx:p.fx,fy:p.fy||1,fz:p.fz,tx:p.tx,ty:p.ty||1,tz:p.tz,maxLife:ml,elapsed:0,mesh};
     }
   }
 
@@ -1411,8 +1450,9 @@ function syncGameState(state){
 // =================================================================
 // ── Idle villager functions ──────────────────────────────────────────────────
 function getIdleVillagers(){
+  const busyStates=new Set(['moving_to_gather','gathering','returning','moving_to_build','building','moving_to_farm','farming','moving','moving_to_attack','attacking']);
   return Object.values(serverUnits).filter(u=>
-    u&&u.team===myTeam&&u.type==='Villager'&&u.state==='idle'
+    u&&u.team===myTeam&&u.type==='Villager'&&!busyStates.has(u.state)
   );
 }
 function updateIdleVillagerUI(){
@@ -1544,9 +1584,15 @@ function refreshSelUI(){
         if((myT.age||0)>=1)addActBtn(panel,'🐴','Train Knight [K]',()=>trainUnit(b.id,'Knight'),'K');
         if((myT.age||0)>=2)addActBtn(panel,'💣','Train Catapult [C]',()=>trainUnit(b.id,'Catapult'),'C');
       } else if(b.type==='Market'){
-        addActBtn(panel,'🌾→💰','Sell 100 Food',()=>sellResource('food'));
-        addActBtn(panel,'🪵→💰','Sell 100 Wood',()=>sellResource('wood'));
-        addActBtn(panel,'🪨→💰','Sell 100 Stone',()=>sellResource('stone'));
+        const myT=serverTeams[myTeam]||{};
+        // Sell buttons — 100 res → 60 gold
+        addActBtn(panel,'🌾→💰','Sell 100 Food for 60 Gold',()=>tradeResource('sell','food'));
+        addActBtn(panel,'🪵→💰','Sell 100 Wood for 60 Gold',()=>tradeResource('sell','wood'));
+        addActBtn(panel,'🪨→💰','Sell 100 Stone for 60 Gold',()=>tradeResource('sell','stone'));
+        // Buy buttons — 160 gold → 100 res
+        addActBtn(panel,'💰→🌾','Buy 100 Food for 160 Gold',()=>tradeResource('buy','food'));
+        addActBtn(panel,'💰→🪵','Buy 100 Wood for 160 Gold',()=>tradeResource('buy','wood'));
+        addActBtn(panel,'💰→🪨','Buy 100 Stone for 160 Gold',()=>tradeResource('buy','stone'));
       }
     }
   } else if(selectedResNodeId){
@@ -1581,13 +1627,16 @@ function addActBtn(panel,icon,label,fn,key=''){
   btn.innerHTML=`<span>${icon}</span><span class="ab-key">${key}</span><span class="tt">${label}</span>`;
   btn.onclick=fn;panel.appendChild(btn);
 }
-function sellResource(res){
-  // Client-side; server doesn't have sell yet, just do it locally for now
+function tradeResource(action,res){
+  const b=serverBuildings[selectedBuildingId];
+  if(!b||b.type!=="Market"||b.underConstruction){alert2("Select a completed Market!",true);return;}
   const t=serverTeams[myTeam];if(!t)return;
-  if((t[res]||0)<100){alert2('Not enough '+res+'!',true);return;}
-  // We'll use a simple cmd for it
-  socket.emit('cmd',{type:'research',techId:'_sell_'+res}); // server will ignore, handled client
-  t[res]-=100;t.gold=(t.gold||0)+50;updateResUI(t);logEv('Traded 100 '+res+' for 50 gold','info');
+  if(action==="sell"){
+    if((t[res]||0)<100){alert2("Not enough "+res+" to sell!",true);return;}
+  } else {
+    if((t.gold||0)<160){alert2("Not enough gold to buy!",true);return;}
+  }
+  socket.emit("cmd",{type:"trade",action,res,buildingId:selectedBuildingId});
 }
 function trainUnit(buildingId,type){socket.emit('cmd',{type:'produce',buildingId,unitType:type});}
 
@@ -1953,7 +2002,7 @@ socket.on('gameStarted',({units,buildings,teams,mapData,team})=>{
   startGameClient();
 });
 
-socket.on('gameState',state=>{
+socket.on('gs',state=>{
   if(gameStarted)syncGameState(state);
 });
 
