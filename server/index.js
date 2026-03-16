@@ -77,7 +77,7 @@ function landPathExists(wx1,wz1,wx2,wz2,h) {
       visited[idx]=1;
       // Use grid cell centre world position for water check
       const wx=-HALF+nc/URES*MAP, wz=-(HALF-nr/VRES*MAP);
-      if(!isW(wx,wz,h)) queue.push([nc,nr]);
+      if(!isWSafe(wx,wz,h)) queue.push([nc,nr]); // must match unit movement threshold
     }
   }
   return false;
@@ -90,6 +90,8 @@ function getH(wx,wz,h) {
   return h[r0*(URES+1)+c0]*(1-fx)*(1-fz)+h[r0*(URES+1)+c1]*fx*(1-fz)+h[r1*(URES+1)+c0]*(1-fx)*fz+h[r1*(URES+1)+c1]*fx*fz;
 }
 function isW(wx,wz,h) { return getH(wx,wz,h)<-1.3; }
+// Slightly larger margin for unit movement — keeps units off the shoreline edge
+function isWSafe(wx,wz,h) { return getH(wx,wz,h)<-1.1; }
 function randAround(cx,cz,r0,r1,h,tries=80) {
   for (let i=0;i<tries;i++) {
     const a=Math.random()*Math.PI*2, r=r0+Math.random()*(r1-r0);
@@ -105,7 +107,7 @@ const UDEFS = {
   Archer:   {hp:40,maxHp:40,atk:9,def:1,spd:0.038,rng:7.0,cost:{wood:25,gold:45},trainTime:8,pop:1,vision:22},
   Knight:   {hp:130,maxHp:130,atk:20,def:6,spd:0.052,rng:1.5,cost:{food:60,gold:75},trainTime:13,pop:2,vision:22},
   Catapult: {hp:90,maxHp:90,atk:40,def:1,spd:0.016,rng:11.0,cost:{wood:200,gold:100},trainTime:20,pop:3,vision:16},
-  Scout:    {hp:55,maxHp:55,atk:5,def:1,spd:0.085,rng:1.2,cost:{food:80},trainTime:7,pop:1,vision:38},
+  Scout:    {hp:55,maxHp:55,atk:5,def:1,spd:0.085,rng:1.2,cost:{food:80},trainTime:7,pop:1,vision:14},
 };
 const BCOSTS={House:{wood:30},Barracks:{wood:175},Farm:{wood:60},Blacksmith:{wood:100,stone:50},Tower:{stone:125},MiningCamp:{wood:100},Lumbercamp:{wood:100},Castle:{stone:650},Market:{wood:175}};
 const BBUILD_TIME={House:20,Farm:20,Blacksmith:20,MiningCamp:20,Lumbercamp:20,Market:20,Tower:60,Barracks:40,Castle:120};
@@ -144,7 +146,7 @@ function generateMap(pox,poz,aox,aoz){
   let h=buildHeights(pox,poz,aox,aoz,seeds);
   // Guarantee a land path between bases — nudge waterBias up until one exists
   let pathAttempts=0;
-  while(!landPathExists(pox,poz,aox,aoz,h)&&pathAttempts<30){
+  while(!landPathExists(pox,poz,aox,aoz,h)&&pathAttempts<50){
     seeds={...seeds,waterBias:seeds.waterBias+0.15};
     h=buildHeights(pox,poz,aox,aoz,seeds);
     pathAttempts++;
@@ -204,7 +206,12 @@ function createLobby(name,hostId){
 }
 
 function gameTick(lobby){
-  const{gs}=lobby, dt=TICK/1000;
+  const now=Date.now();
+  const rawDt=(now-(lobby.lastTick||now))/1000;
+  lobby.lastTick=now;
+  // Clamp dt — prevents teleporting when server lags (e.g. under heavy load)
+  const dt=Math.min(rawDt, 0.1);
+  const{gs}=lobby;
   const{units,buildings,teams,resNodes,heights}=gs;
   gs.gameTime+=dt;
   // Build a Map for O(1) resNode lookups — replaces O(n) .find() calls
@@ -214,16 +221,64 @@ function gameTick(lobby){
   }
   const resMap=gs._resMap;
 
+  // ── TELEPORT DIAGNOSTICS ─────────────────────────────────────────────────
+  // Log any unit that moves more than 5 world units in a single tick,
+  // or has tx/tz near (0,0), or has an unexpected state transition.
+  if(!gs._prevPos) gs._prevPos={};
+  for(const id in units){
+    const u=units[id];if(u.dead)continue;
+    const prev=gs._prevPos[id];
+    if(prev){
+      const jumped=Math.sqrt((u.x-prev.x)**2+(u.z-prev.z)**2);
+      if(jumped>5){
+        console.log(`[TELEPORT] unit ${id} type=${u.type} owner=${u.ownerId} state=${u.state} jumped ${jumped.toFixed(1)} units  pos=(${u.x.toFixed(1)},${u.z.toFixed(1)}) prev=(${prev.x.toFixed(1)},${prev.z.toFixed(1)}) tx=${u.tx?.toFixed(1)} tz=${u.tz?.toFixed(1)} dt=${dt.toFixed(3)}`);
+      }
+      if(Math.abs(u.tx)<2&&Math.abs(u.tz)<2&&u.state!=='idle'&&u.state!=='gathering'&&u.state!=='returning'){
+        console.log(`[NEAR_ZERO_TARGET] unit ${id} type=${u.type} owner=${u.ownerId} state=${u.state} tx=${u.tx?.toFixed(2)} tz=${u.tz?.toFixed(2)} pos=(${u.x.toFixed(1)},${u.z.toFixed(1)})`);
+      }
+    }
+    gs._prevPos[id]={x:u.x,z:u.z};
+  }
+  // Log large dt spikes
+  if(rawDt>0.2){
+    console.log(`[DT_SPIKE] lobby=${lobby.id} rawDt=${rawDt.toFixed(3)}s clamped to ${dt.toFixed(3)}s unitCount=${Object.keys(units).length} gameTime=${gs.gameTime.toFixed(1)}`);
+  }
+  // ── END DIAGNOSTICS ───────────────────────────────────────────────────────
+
   function iW(x,z){return isW(x,z,heights);}
   function gH(x,z){return getH(x,z,heights);}
 
   function moveU(u,tx,tz){
+    // Guard: if unit has NaN position, teleport it back to a safe spawn point
+    if(!isFinite(u.x)||!isFinite(u.z)){
+      console.log(`[NaN_RESCUE] unit ${u.id} type=${u.type} owner=${u.ownerId} state=${u.state} — resetting position`);
+      const sx=u.team===1?gs.pox:gs.aox, sz=u.team===1?gs.poz:gs.aoz;
+      u.x=sx+(Math.random()-0.5)*6; u.z=sz+(Math.random()-0.5)*6;
+      u.tx=u.x; u.tz=u.z; u.state='idle'; return true;
+    }
+    if(!isFinite(tx)||!isFinite(tz)){u.tx=u.x;u.tz=u.z;return true;}
     const dx=tx-u.x,dz=tz-u.z,d=Math.sqrt(dx*dx+dz*dz);
     if(d<0.15)return true;
     const step=Math.min(u.spd*60*dt,d);
     let nx=u.x+(dx/d)*step,nz=u.z+(dz/d)*step;
-    if(iW(nx,nz)){let mv=false;const ba=Math.atan2(dx,dz);for(let i=1;i<=8&&!mv;i++)for(const s of[1,-1]){const a=ba+s*i*(Math.PI/8),cx=u.x+Math.sin(a)*step,cz=u.z+Math.cos(a)*step;if(!iW(cx,cz)){nx=cx;nz=cz;mv=true;break;}}if(!mv)return false;}
+    if(!isFinite(nx)||!isFinite(nz)){return false;} // discard bad result
+    if(isWSafe(nx,nz,heights)){let mv=false;const ba=Math.atan2(dx,dz);for(let i=1;i<=8&&!mv;i++)for(const s of[1,-1]){const a=ba+s*i*(Math.PI/8),cx=u.x+Math.sin(a)*step,cz=u.z+Math.cos(a)*step;if(!isWSafe(cx,cz,heights)){nx=cx;nz=cz;mv=true;break;}}if(!mv)return false;}
     u.x=nx;u.z=nz;return false;
+  }
+
+  // ─ NaN position detection — catch and fix before movement corrupts others ─
+  for(const id in units){
+    const u=units[id];if(u.dead)continue;
+    if(!isFinite(u.x)||!isFinite(u.z)){
+      console.log(`[NaN_DETECTED] BEFORE_TICK id=${id} type=${u.type} owner=${u.ownerId} state=${u.state} x=${u.x} z=${u.z} tx=${u.tx} tz=${u.tz} gameTime=${gs.gameTime.toFixed(1)}`);
+      const sx=u.team===1?gs.pox:gs.aox, sz=u.team===1?gs.poz:gs.aoz;
+      u.x=sx+(Math.random()-0.5)*6; u.z=sz+(Math.random()-0.5)*6;
+      u.tx=u.x; u.tz=u.z; u.state='idle';
+    }
+    if(!isFinite(u.tx)||!isFinite(u.tz)){
+      console.log(`[NaN_TARGET] id=${id} type=${u.type} owner=${u.ownerId} state=${u.state} tx=${u.tx} tz=${u.tz}`);
+      u.tx=u.x; u.tz=u.z; u.state='idle';
+    }
   }
 
   // ─ Unit ticks ─
@@ -231,13 +286,55 @@ function gameTick(lobby){
     const u=units[id];if(u.dead)continue;
     u.atkTimer=Math.max(0,u.atkTimer-dt);
 
-    // auto-attack
-    if((u.state==='idle'||u.state==='attack_move')&&u.atkTimer<=0&&!u.target){
+    // auto-attack — only for human-owned units; AI units are managed by tickAI
+    const isAIUnit=u.ownerId&&u.ownerId.startsWith('ai_team_');
+    if(!isAIUnit&&u.state==='idle'&&u.atkTimer<=0&&!u.target&&!u._returning){
+      if(u.type==='Villager'){
+        let nearestEnemy=null,nearestDist=5;
+        for(const oid in units){const o=units[oid];if(!o.dead&&o.team!==u.team){const d=dist2D(u.x,u.z,o.x,o.z);if(d<nearestDist){nearestDist=d;nearestEnemy=o;}}}
+        if(nearestEnemy){
+          const dx=u.x-nearestEnemy.x,dz=u.z-nearestEnemy.z;
+          const len=Math.sqrt(dx*dx+dz*dz)||1;
+          u.tx=Math.max(-HALF+3,Math.min(HALF-3,u.x+(dx/len)*12));
+          u.tz=Math.max(-HALF+3,Math.min(HALF-3,u.z+(dz/len)*12));
+          u.state='moving';
+        }
+      } else {
+        // military auto-engage when idle
+        let best=null,bd=u.rng+6;
+        for(const oid in units){const o=units[oid];if(!o.dead&&o.team!==u.team){const d=dist2D(u.x,u.z,o.x,o.z);if(d<bd){bd=d;best=o;}}}
+        if(!best)for(const bid in buildings){const b=buildings[bid];if(!b.dead&&b.team!==u.team){const d=dist2D(u.x,u.z,b.x,b.z);if(d<bd){bd=d;u.state='attacking_building';u.target=bid;}}}
+        if(best&&!u.target){
+          u.target=best.id;
+          u._leashX=u.x;u._leashZ=u.z; // leash origin
+          u.state='attacking';
+        }
+      }
+    }
+    // attack_move auto-engage (explicit player order — no leash)
+    if(!isAIUnit&&u.state==='attack_move'&&u.atkTimer<=0&&!u.target){
       let best=null,bd=u.rng+6;
       for(const oid in units){const o=units[oid];if(!o.dead&&o.team!==u.team){const d=dist2D(u.x,u.z,o.x,o.z);if(d<bd){bd=d;best=o;}}}
-      if(!best)for(const bid in buildings){const b=buildings[bid];if(!b.dead&&b.team!==u.team){const d=dist2D(u.x,u.z,b.x,b.z);if(d<bd){bd=d;u.state='attacking_building';u.target=bid;}}}
-      if(best&&!u.target){u.target=best.id;if(u.state==='idle')u.state='attacking';}
+      if(best){u.target=best.id;u.state='attacking';}
     }
+
+    // Leash: only applies to human units (AI units have their own attack management)
+    const MAX_LEASH=18;
+    if(!isAIUnit&&u._leashX!==undefined&&u.state==='attacking'){
+      if(dist2D(u.x,u.z,u._leashX,u._leashZ)>MAX_LEASH){
+        u.target=null;u.state='moving';
+        u.tx=u._leashX;u.tz=u._leashZ;
+        u._returning=true;u._leashX=undefined;u._leashZ=undefined;
+      }
+    }
+    // Clear leash state when not in combat
+    if(u.state!=='attacking'&&u.state!=='moving_to_attack'){
+      u._leashX=undefined;u._leashZ=undefined;
+    }
+    // Clear returning flag as soon as unit goes idle (arrives at leash origin)
+    // Must happen before auto-attack check — but auto-attack is gated on !_returning
+    // so the unit gets one idle tick before it can re-engage
+    if(u._returning&&u.state==='idle'){u._returning=false;}
 
     switch(u.state){
       case 'moving':case 'attack_move':if(moveU(u,u.tx,u.tz))u.state='idle';break;
@@ -247,7 +344,7 @@ function gameTick(lobby){
         break;
       }
       case 'attacking':{
-        if(!u.target||!units[u.target]||units[u.target].dead){u.target=null;u.state='idle';break;}
+        if(!u.target||!units[u.target]||units[u.target].dead){u.target=null;u.state='idle';u.autoAttackOrigin=null;break;}
         const t=units[u.target],d=dist2D(u.x,u.z,t.x,t.z);
         if(d>u.rng)moveU(u,t.x,t.z);
         else if(u.atkTimer<=0){
@@ -265,6 +362,30 @@ function gameTick(lobby){
           b.hp-=Math.max(1,u.atk-1);u.atkTimer=1.5;
           if(u.rng>2)gs.projPool.push({id:uid(),fx:u.x,fy:gH(u.x,u.z)+1.5,fz:u.z,tx:b.x,ty:gH(b.x,b.z)+1,tz:b.z,color:u.type==='Catapult'?0xff6600:0xd8d8b0,life:1.5,maxLife:1.5});
           if(b.hp<=0){b.dead=true;if(b.type==='House')teams[b.team].maxPop-=5;gs.events.push({msg:`${b.team===1?'Blue':'Red'} ${b.type} destroyed!`,type:b.team===u.team?'good':'bad'});u.target=null;u.state='idle';}
+        }
+        break;
+      }
+      case 'moving_to_farm':{
+        const farm=buildings[u.farmTarget];
+        if(!farm||farm.dead||farm.underConstruction){u.state='idle';u.farmTarget=null;break;}
+        const fd=dist2D(u.x,u.z,farm.x,farm.z);
+        if(fd<0.3){
+          u.state='farming';
+          u.x=farm.x+(Math.random()-0.5)*0.3;u.z=farm.z+(Math.random()-0.5)*0.3;
+        } else {
+          // Move directly toward farm center — bypass isWSafe since farm is on land
+          const fdx=farm.x-u.x,fdz=farm.z-u.z;
+          const fstep=Math.min(u.spd*60*dt,fd);
+          u.x+=fdx/fd*fstep; u.z+=fdz/fd*fstep;
+        }
+        break;
+      }
+      case 'farming':{
+        const farm=buildings[u.farmTarget];
+        if(!farm||farm.dead||farm.underConstruction){u.state='idle';u.farmTarget=null;break;}
+        // Keep villager on top of farm — snap back if separation nudged them off
+        if(dist2D(u.x,u.z,farm.x,farm.z)>0.5){
+          u.x=farm.x+(Math.random()-0.5)*0.3;u.z=farm.z+(Math.random()-0.5)*0.3;
         }
         break;
       }
@@ -321,18 +442,23 @@ function gameTick(lobby){
   }
 
   // ─ Unit separation (prevent stacking) ─
-  const MIN_SEP=0.85; // minimum centre-to-centre distance in world units
-  const PUSH=0.18;    // fraction of overlap to resolve per tick
-  // Reuse separation array — avoid allocating a new array every tick
+  // Run every other tick to halve CPU cost; early-exit on distance to skip distant pairs
+  gs._sepTick=(gs._sepTick||0)+1;
+  if(gs._sepTick%2===0){
+  const MIN_SEP=0.85;
+  const PUSH=0.18;
   if(!gs._uArr) gs._uArr=[];
   const uArr=gs._uArr;
   uArr.length=0;
   for(const id in units){if(!units[id].dead)uArr.push(units[id]);}
   for(let i=0;i<uArr.length;i++){
     const a=uArr[i];
+    if(!isFinite(a.x)||!isFinite(a.z))continue; // skip NaN units — don't let them infect others
     for(let j=i+1;j<uArr.length;j++){
       const b=uArr[j];
+      if(!isFinite(b.x)||!isFinite(b.z))continue;
       const dx=a.x-b.x,dz=a.z-b.z;
+      if(Math.abs(dx)>MIN_SEP||Math.abs(dz)>MIN_SEP)continue;
       const d2=dx*dx+dz*dz;
       if(d2>=MIN_SEP*MIN_SEP||d2===0)continue;
       const d=Math.sqrt(d2);
@@ -343,12 +469,15 @@ function gameTick(lobby){
       const bMoving=(b.state==='moving'||b.state==='attacking'||b.state==='moving_to_attack');
       const aShare=bMoving?0.35:0.65;
       const bShare=aMoving?0.35:0.65;
-      const ax2=a.x+nx*overlap*aShare, az2=a.z+nz*overlap*aShare;
-      const bx2=b.x-nx*overlap*bShare, bz2=b.z-nz*overlap*bShare;
-      if(!iW(ax2,az2)){a.x=ax2;a.z=az2;}
-      if(!iW(bx2,bz2)){b.x=bx2;b.z=bz2;}
+      const ax2=Math.max(-HALF+1,Math.min(HALF-1,a.x+nx*overlap*aShare));
+      const az2=Math.max(-HALF+1,Math.min(HALF-1,a.z+nz*overlap*aShare));
+      const bx2=Math.max(-HALF+1,Math.min(HALF-1,b.x-nx*overlap*bShare));
+      const bz2=Math.max(-HALF+1,Math.min(HALF-1,b.z-nz*overlap*bShare));
+      if(!isWSafe(ax2,az2,heights)){a.x=ax2;a.z=az2;}
+      if(!isWSafe(bx2,bz2,heights)){b.x=bx2;b.z=bz2;}
     }
   }
+  } // end every-other-tick separation
 
   // ─ Tower autofire ─
   for(const bid in buildings){
@@ -431,6 +560,11 @@ function gameTick(lobby){
       for(const b of Object.values(buildings)){
         if(b.dead||b.underConstruction||b.team!==t) continue;
         if(b.type==='Farm'){
+          const hasFarmer=Object.values(units).some(u=>
+            !u.dead&&u.team===t&&u.type==='Villager'&&
+            u.state==='farming'&&u.farmTarget===b.id
+          );
+          if(!hasFarmer) continue;
           teams[t].food=Math.min(9999,(teams[t].food||0)+fa);
           gs.events.push({type:'farm_income',res:'food',amt:fa,x:b.x,z:b.z,team:t});
         } else if(b.type==='Lumbercamp'){
@@ -442,7 +576,7 @@ function gameTick(lobby){
   }
 
   // ─ AI players ─
-  const aiCtx={uid,UDEFS,BCOSTS,BHPS,BSIZES,MAP,HALF,URES,VRES,resMap:gs._resMap||new Map()};
+  const aiCtx={uid,UDEFS,BCOSTS,BHPS,BSIZES,MAP,HALF,URES,VRES,resMap:gs._resMap||new Map(),pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz};
   for(const[team,aiP] of Object.entries(lobby.aiPlayers||{})){
     tickAIPlayer(lobby, dt, Number(team), aiP.difficulty, aiCtx);
   }
@@ -450,10 +584,32 @@ function gameTick(lobby){
   // ─ Score ─
   teams[1].score+=dt*0.5;teams[2].score+=dt*0.5;
 
-  // ─ Win check ─
+  // ─ Win check — TC is dead if missing from buildings (deleted) OR flagged dead ─
   const b1=buildings[gs.tc1],b2=buildings[gs.tc2];
-  if(b1&&b1.dead){endGame(lobby,2);return;}
-  if(b2&&b2.dead){endGame(lobby,1);return;}
+  if(!b1||b1.dead){endGame(lobby,2);return;}
+  if(!b2||b2.dead){endGame(lobby,1);return;}
+
+  // ─ Water rescue — pull any unit that drifted into water back to safe land ─
+  for(const id in units){
+    const u=units[id];
+    if(u.dead||!isW(u.x,u.z,heights)) continue;
+    // Unit is in water — find nearest dry cell by spiralling outward
+    let rescued=false;
+    for(let r=1;r<=8&&!rescued;r++){
+      for(let dx2=-r;dx2<=r&&!rescued;dx2++){
+        for(let dz2=-r;dz2<=r&&!rescued;dz2++){
+          if(Math.abs(dx2)<r&&Math.abs(dz2)<r) continue; // only check perimeter
+          const tx2=u.x+dx2*1.0, tz2=u.z+dz2*1.0;
+          if(!isWSafe(tx2,tz2,heights)){u.x=tx2;u.z=tz2;u.state='idle';rescued=true;}
+        }
+      }
+    }
+  }
+
+  // ─ Prune depleted resource nodes from the array ─
+  const prevLen=gs.resNodes.length;
+  gs.resNodes=gs.resNodes.filter(r=>!r.depleted);
+  if(gs.resNodes.length!==prevLen) gs._resMapDirty=true;
 
   // ─ Prune dead — include dead units in this tick's delta so clients remove them ─
   if(!gs._unitSnap) gs._unitSnap={};
@@ -476,9 +632,11 @@ function gameTick(lobby){
   if(!gs._unitSnap) gs._unitSnap={};
   for(const[id,u] of Object.entries(units)){
     const snap=gs._unitSnap[id];
-    // Only include unit if any tracked field has changed since last tick
-    if(snap&&Math.abs(snap.x-u.x)<0.001&&Math.abs(snap.z-u.z)<0.001
-        &&snap.hp===u.hp&&snap.state===u.state&&snap.tx===u.tx&&snap.tz===u.tz){
+    // Only include unit if meaningful change since last tick.
+    // Use a 0.05 threshold for position to absorb float jitter from separation nudges.
+    if(snap&&Math.abs(snap.x-u.x)<0.05&&Math.abs(snap.z-u.z)<0.05
+        &&Math.abs((snap.tx||0)-(u.tx||0))<0.05&&Math.abs((snap.tz||0)-(u.tz||0))<0.05
+        &&snap.hp===u.hp&&snap.state===u.state){
       continue; // unchanged — skip it this tick
     }
     unitsDelta[id]={id:u.id,x:u.x,z:u.z,tx:u.tx,tz:u.tz,hp:u.hp,maxHp:u.maxHp,state:u.state,team:u.team,type:u.type,pop:u.pop};
@@ -506,8 +664,10 @@ function gameTick(lobby){
         rallyX:b.rallyX,rallyZ:b.rallyZ,rallyResourceId:b.rallyResourceId};
     }
   }
-  // Now actually remove dead buildings from the map
-  for(const id in buildings)if(buildings[id].dead)delete buildings[id];
+  // Remove dead buildings except the two TCs (win check needs to find them)
+  for(const id in buildings){
+    if(buildings[id].dead&&id!==gs.tc1&&id!==gs.tc2) delete buildings[id];
+  }
   // Resource nodes: only send amount delta each tick — static fields (x,z,type,maxAmount,isTree,variety)
   // were already sent on game start and never change.
   const resNodesDelta=gs.resNodes.filter(r=>!r.depleted).map(r=>({id:r.id,amount:r.amount}));
@@ -608,6 +768,7 @@ io.on('connection',socket=>{
         mapData:{heightsB64,resNodes:gs.resNodes,pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz}
       });
     }
+    lobby.lastTick=Date.now();
     lobby.tickInterval=setInterval(()=>gameTick(lobby),TICK);
   });
 
@@ -617,9 +778,9 @@ io.on('connection',socket=>{
     const gs=lobby.gs;const{units,buildings,teams}=gs;
 
     if(cmd.type==='setRally'){const b=buildings[cmd.buildingId];if(b&&b.ownerId===socket.id){b.rallyX=cmd.x;b.rallyZ=cmd.z;b.rallyResourceId=cmd.resourceId||null;}}
-    else if(cmd.type==='move'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;u.state='moving';u.tx=cmd.x;u.tz=cmd.z;u.target=null;}}
-    else if(cmd.type==='stop'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;u.state='idle';u.target=null;}}
-    else if(cmd.type==='attack'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;if(units[cmd.targetId]){u.state='attacking';u.target=cmd.targetId;}else if(buildings[cmd.targetId]){u.state='attacking_building';u.target=cmd.targetId;}}}
+    else if(cmd.type==='move'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;u.state='moving';u.tx=cmd.x;u.tz=cmd.z;u.target=null;u._returning=false;u._leashX=undefined;u._leashZ=undefined;}}
+    else if(cmd.type==='stop'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;u.state='idle';u.target=null;u._returning=false;u._leashX=undefined;u._leashZ=undefined;}}
+    else if(cmd.type==='attack'){for(const id of(cmd.unitIds||[])){const u=units[id];if(!u||u.ownerId!==socket.id)continue;u._returning=false;u._leashX=undefined;u._leashZ=undefined;if(units[cmd.targetId]){u.state='attacking';u.target=cmd.targetId;}else if(buildings[cmd.targetId]){u.state='attacking_building';u.target=cmd.targetId;}}}
     else if(cmd.type==='resume_build'){
       const b=buildings[cmd.buildingId];
       if(!b||b.dead||!b.underConstruction||b.team!==p.team)return;

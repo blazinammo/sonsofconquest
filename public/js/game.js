@@ -1084,17 +1084,22 @@ function handleRMB(e){
   const wp=getWorldClick(e);if(!wp)return;
   const tx=wp.x,tz=wp.z;
 
-  // ── Resume construction: RMB on a friendly under-construction building ──
-  // Check this before anything else so it takes priority over move
+  // ── Resume construction / assign to farm: RMB on a friendly building ───────
   const vids=selectedUnitIds.filter(id=>serverUnits[id]?.type==='Villager');
   if(vids.length){
     for(const id in serverBuildings){
       const b=serverBuildings[id];
-      if(!b||b.team!==myTeam||!b.underConstruction)continue;
-      if(Math.sqrt((b.x-tx)**2+(b.z-tz)**2)<(b.size||1.5)+2.5){
+      if(!b||b.team!==myTeam)continue;
+      const dist=Math.sqrt((b.x-tx)**2+(b.z-tz)**2);
+      // Under-construction: send to build
+      if(b.underConstruction&&dist<(b.size||1.5)+2.5){
         socket.emit('cmd',{type:'resume_build',unitIds:vids,buildingId:id});
-        spawnClickMark(tx,tz);
-        return;
+        spawnClickMark(tx,tz);return;
+      }
+      // Completed farm: assign villager to work it
+      if(!b.underConstruction&&b.type==='Farm'&&dist<(b.size||2.0)+1.5){
+        socket.emit('cmd',{type:'farm_work',unitIds:vids,buildingId:id});
+        spawnClickMark(tx,tz);return;
       }
     }
   }
@@ -1221,20 +1226,29 @@ function syncGameState(state){
   // ─ Resource nodes delta — server now sends only {id,amount} each tick.
   // Merge into serverResNodes; static fields (x,z,type,maxAmount,isTree,variety)
   // were set once on game start and are preserved here.
-  if(resNodes&&resNodes.length>0){
-    if(resNodes[0].x!==undefined){
+  if(resNodes!=null){
+    if(resNodes.length>0&&resNodes[0].x!==undefined){
       // Full node data (game start) — replace entirely
       serverResNodes=resNodes;
     } else {
-      // Delta — only amount changed, update in place
+      // Delta — only amount; nodes absent from delta have been deleted on server
       const deltaMap={};for(const d of resNodes) deltaMap[d.id]=d.amount;
-      serverResNodes=serverResNodes.filter(r=>{
-        if(deltaMap[r.id]!==undefined){r.amount=deltaMap[r.id];return true;}
-        return false; // depleted (not in delta) — remove
-      });
+      const surviving=[];
+      for(const r of serverResNodes){
+        if(deltaMap[r.id]!==undefined){
+          r.amount=deltaMap[r.id];
+          surviving.push(r);
+        } else {
+          // Node no longer exists — remove its mesh
+          if(resNodeMeshes[r.id]){
+            scene.remove(resNodeMeshes[r.id]);
+            delete resNodeMeshes[r.id];
+          }
+          if(selectedResNodeId===r.id){selectedResNodeId=null;refreshSelUI();}
+        }
+      }
+      serverResNodes=surviving;
     }
-  } else if(resNodes&&resNodes.length===0){
-    serverResNodes=[];
   }
   if(selectedResNodeId&&!serverResNodes.find(r=>r.id===selectedResNodeId)){selectedResNodeId=null;refreshSelUI();}
   for(const rn of serverResNodes){
@@ -1252,27 +1266,33 @@ function syncGameState(state){
   }
 
   // ─ Units ─
-  // Step 1: merge sparse delta into serverUnits FIRST so serverUnits is always
-  // the full live picture. Delta only contains units that changed this tick.
-  for(const id in units) serverUnits[id]=units[id];
+  // Step 1: merge sparse delta into serverUnits, PRESERVING static fields.
+  // The delta only contains slim fields (x,z,hp,state,etc). Fields like vision,
+  // atk, def, spd, rng are only sent on game start. Merge field-by-field so
+  // we never lose static data that isn't re-sent each tick.
+  for(const id in units){
+    const delta=units[id];
+    if(delta.dead){
+      // Death signal — keep the dead flag but don't overwrite good data
+      if(serverUnits[id]) serverUnits[id].dead=true;
+      else serverUnits[id]=delta;
+    } else if(serverUnits[id]){
+      // Merge only the fields present in the delta — preserve everything else
+      const u=serverUnits[id];
+      u.x=delta.x;u.z=delta.z;u.tx=delta.tx;u.tz=delta.tz;
+      u.hp=delta.hp;u.maxHp=delta.maxHp;u.state=delta.state;u.pop=delta.pop;
+    } else {
+      // New unit not yet in serverUnits
+      serverUnits[id]=delta;
+    }
+  }
 
-  // Step 2: death detection — server stops sending a unit when it dies.
-  // The server also prunes dead units from its own map, so after a few ticks
-  // a dead unit simply disappears from every delta. We detect death by tracking
-  // which ids the server has ever acknowledged; once absent from several consecutive
-  // deltas we consider it dead. Simple approach: server sends explicit dead flag
-  // OR unit vanishes from delta AND has no mesh yet — but the safest approach
-  // is to only remove meshes for units the server explicitly marks dead (dead:true)
-  // OR that have been absent from ALL deltas for >1s (stale).
-  // Since our delta skips unchanged units, we can't use "absent = dead".
-  // Instead: server sets unit.dead=true in the delta when a unit dies this tick,
-  // and we check for that here.
+  // Step 2: death detection — ONLY on explicit dead:true.
   for(const id in unitMeshes){
     const u=serverUnits[id];
-    // Remove mesh if unit is explicitly dead OR no longer tracked at all
-    if(!u||u.dead===true){
+    if(u&&u.dead===true){
       if(buildingMeshes[id])continue;
-      spawnDeathFX(unitMeshes[id].position,u?.team||serverUnits[id]?.team||1);
+      spawnDeathFX(unitMeshes[id].position,u.team||1);
       scene.remove(unitMeshes[id]);delete unitMeshes[id];
       delete interpFrom[id];delete interpTo[id];
       delete serverUnits[id];
@@ -1280,7 +1300,20 @@ function syncGameState(state){
     }
   }
 
-  // Step 3: spawn meshes for any unit we know about but haven't rendered yet
+  // Step 3: Before resetting interpT, lock unchanged units in place by syncing
+  // their interpFrom/interpTo to their current mesh position. This prevents the
+  // "snap-back" oscillation that occurs when interpT resets to 0 every tick.
+  for(const id in unitMeshes){
+    if(units[id]) continue; // changed this tick — interp targets updated in step 4
+    const mesh=unitMeshes[id];
+    if(!mesh) continue;
+    // Unit is stationary this tick — pin it at its current rendered position
+    if(interpFrom[id]){interpFrom[id].x=mesh.position.x;interpFrom[id].z=mesh.position.z;}
+    if(interpTo[id])  {interpTo[id].x  =mesh.position.x;interpTo[id].z  =mesh.position.z;}
+  }
+  interpT=0;
+
+  // Step 4: spawn meshes and update interp targets for units in the delta
   for(const id in serverUnits){
     const u=serverUnits[id];
     if(!u||u.dead)continue;
@@ -1290,11 +1323,12 @@ function syncGameState(state){
       if(mesh){mesh.position.x=u.x;mesh.position.z=u.z;mesh.position.y=getHeight(u.x,u.z);}
       interpFrom[id]={x:u.x,z:u.z};interpTo[id]={x:u.x,z:u.z};continue;
     }
-    // Step 4: update interpolation targets for units that changed this tick
-    if(!units[id]) continue; // not in delta this tick — skip, keep last interp target
+    if(!units[id]) continue; // not in delta — already pinned in step 3
     const mesh=unitMeshes[id];
     interpFrom[id]={x:mesh.position.x,z:mesh.position.z};
     interpTo[id]={x:u.x,z:u.z};
+    if(Math.abs(u.x)<1.5&&Math.abs(u.z)<1.5&&u.state!=='idle'&&u.state!=='gathering')
+      console.warn('[SERVER_NEAR_ZERO]',id,u.type,u.state,'pos:('+u.x.toFixed(2)+','+u.z.toFixed(2)+')','tx:'+u.tx?.toFixed(2),'tz:'+u.tz?.toFixed(2));
     const hpFg=mesh.userData.hpFg;
     if(hpFg){const pct=u.hp/u.maxHp;hpFg.scale.x=Math.max(0.01,pct);hpFg.position.x=-(mesh.userData.hpFgWidth/2)*(1-pct);hpFg.material.color.set(pct>0.6?0x4cdd4c:pct>0.3?0xffaa20:0xee3030);}
     if(u.state==='moving'||u.state==='moving_to_attack'||u.state==='attacking'){
@@ -1302,7 +1336,6 @@ function syncGameState(state){
       if(Math.abs(dx)+Math.abs(dz)>0.1)mesh.rotation.y=Math.atan2(dx,dz);
     }
   }
-  interpT=0;
 
   // ─ Buildings ─
   // Merge delta into serverBuildings; handle dead:true as an explicit removal signal
@@ -1439,7 +1472,7 @@ const UNIT_DEFS={
   Archer:   {hp:40,maxHp:40,atk:9,def:1,spd:0.038,rng:7.0,cost:{wood:25,gold:45},trainTime:8,pop:1,icon:'🏹',vision:22},
   Knight:   {hp:130,maxHp:130,atk:20,def:6,spd:0.052,rng:1.5,cost:{food:60,gold:75},trainTime:13,pop:2,icon:'🐴',vision:22},
   Catapult: {hp:90,maxHp:90,atk:40,def:1,spd:0.016,rng:11.0,cost:{wood:200,gold:100},trainTime:20,pop:3,icon:'💣',vision:16},
-  Scout:    {hp:55,maxHp:55,atk:5,def:1,spd:0.085,rng:1.2,cost:{food:80},trainTime:7,pop:1,icon:'🏇',vision:38},
+  Scout:    {hp:55,maxHp:55,atk:5,def:1,spd:0.085,rng:1.2,cost:{food:80},trainTime:7,pop:1,icon:'🏇',vision:14},
 };
 const BUILD_COSTS={House:{wood:30},Barracks:{wood:175},Farm:{wood:60},Blacksmith:{wood:100,stone:50},Tower:{stone:125},MiningCamp:{wood:100},Lumbercamp:{wood:100},Castle:{stone:650},Market:{wood:175}};
 const TECHS=[
@@ -2008,7 +2041,7 @@ function startGameClient(){
   camTarget=new THREE.Vector3(mySpawnX,0,mySpawnZ);
 
   // Tips
-  setTimeout(()=>alert2('Scout has 38 vision — explore the map!'),5000);
+  setTimeout(()=>alert2('Scout has 14 vision — explore the map!'),5000);
   setTimeout(()=>alert2('Build Houses to increase population cap!'),20000);
   setTimeout(()=>alert2('Research technologies in your Town Center!'),35000);
 
@@ -2026,6 +2059,19 @@ function tickInterp(dt){
     const mesh=unitMeshes[id],fr=interpFrom[id],to=interpTo[id];
     if(!fr||!to)continue;
     const nx=fr.x+(to.x-fr.x)*t,nz=fr.z+(to.z-fr.z)*t;
+    // ── CLIENT DIAGNOSTIC ──
+    const dx=nx-mesh.position.x, dz=nz-mesh.position.z;
+    const jump=Math.sqrt(dx*dx+dz*dz);
+    if(jump>4){
+      const u=serverUnits[id];
+      console.warn('[CLIENT_JUMP]',id,u?.type,u?.state,'jump:'+jump.toFixed(1),'from:('+mesh.position.x.toFixed(1)+','+mesh.position.z.toFixed(1)+')','to:('+nx.toFixed(1)+','+nz.toFixed(1)+')','fr:('+fr.x.toFixed(1)+','+fr.z.toFixed(1)+')','interpTo:('+to.x.toFixed(1)+','+to.z.toFixed(1)+')','t:'+t.toFixed(2));
+    }
+    if(Math.abs(to.x)<1.5&&Math.abs(to.z)<1.5&&to.x!==undefined){
+      const u=serverUnits[id];
+      if(u&&u.state!=='idle'&&u.state!=='gathering')
+        console.warn('[CLIENT_ZERO_TARGET]',id,u?.type,u?.state,'target:('+to.x.toFixed(2)+','+to.z.toFixed(2)+')');
+    }
+    // ── END DIAGNOSTIC ──
     if(Math.abs(nx-mesh.position.x)>0.02||Math.abs(nz-mesh.position.z)>0.02){
       mesh.position.x=nx;mesh.position.z=nz;mesh.position.y=getHeight(nx,nz);
     }
