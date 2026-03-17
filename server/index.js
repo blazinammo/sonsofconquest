@@ -10,7 +10,10 @@ const httpServer = createServer(app);
 const io = new Server(httpServer, { cors: { origin: '*' } });
 app.use(express.static(path.join(__dirname, '../public')));
 
-const MAP = 150, HALF = 75, TICK = 150;
+// MAP and HALF are now per-lobby (150/75 for 2p, 300/150 for 3-4p)
+const TICK = 150;
+const MAP_SMALL = 150, HALF_SMALL = 75;   // 2-player
+const MAP_LARGE = 300, HALF_LARGE = 150;  // 3-4 player
 // Unit state: full string → compact code for wire protocol
 const STATE_ENC={idle:'i',moving:'m',attacking:'a',attacking_building:'ab',
   moving_to_attack:'ma',moving_to_build:'mb',building:'b',
@@ -27,17 +30,20 @@ function noise(x,z,s,a,ox=0,oz=0) {
        + Math.sin((x+ox)*s*2.1+0.5)*Math.cos((z+oz)*s*1.8)*a*0.4
        + Math.sin((x+ox)*s*4.3-1.2)*Math.cos((z+oz)*s*3.9+0.8)*a*0.15;
 }
-function noiseH(x,z,pox,poz,aox,aoz,seeds) {
+function noiseH(x,z,spawns,seeds) {
   // Three octaves with random offsets, plus a large-scale basin layer
   const raw = noise(x,z,0.05,3.5,  seeds.o1x,seeds.o1z)
             + noise(x,z,0.12,1.2,  seeds.o2x,seeds.o2z)
             + noise(x,z,0.25,0.4,  seeds.o3x,seeds.o3z)
             + noise(x,z,0.018,seeds.basinAmp, seeds.o4x,seeds.o4z);
   // Flatten terrain near each spawn so bases are always playable
-  const pd=Math.sqrt((x-pox)**2+(z-poz)**2), pf=1-Math.min(1,Math.max(0,(pd-12)/7));
-  const ed=Math.sqrt((x-aox)**2+(z-aoz)**2), ef=1-Math.min(1,Math.max(0,(ed-12)/7));
-  // Shift all heights by waterBias: negative = more water, positive = more land
-  return raw*(1-Math.max(pf,ef)) + seeds.waterBias;
+  let maxFlat=0;
+  for(const[sx,sz] of spawns){
+    const pd=Math.sqrt((x-sx)**2+(z-sz)**2);
+    const pf=1-Math.min(1,Math.max(0,(pd-12)/7));
+    if(pf>maxFlat) maxFlat=pf;
+  }
+  return raw*(1-maxFlat) + seeds.waterBias;
 }
 function makeSeeds() {
   // waterBias chosen from a weighted set so each map feels distinct:
@@ -51,18 +57,17 @@ function makeSeeds() {
   const R=()=>(Math.random()-0.5)*400;
   return{o1x:R(),o1z:R(),o2x:R(),o2z:R(),o3x:R(),o3z:R(),o4x:R(),o4z:R(),basinAmp,waterBias};
 }
-function buildHeights(pox,poz,aox,aoz,seeds) {
+function buildHeights(spawns,seeds,MAP,HALF) {
   const h=new Array((URES+1)*(VRES+1));
   for (let r=0;r<=VRES;r++) for (let c=0;c<=URES;c++) {
-    h[r*(URES+1)+c]=noiseH(-HALF+c/URES*MAP, -(HALF-r/VRES*MAP), pox,poz,aox,aoz,seeds);
+    h[r*(URES+1)+c]=noiseH(-HALF+c/URES*MAP, -(HALF-r/VRES*MAP), spawns, seeds);
   }
   return h;
 }
 
 // BFS on the height grid — returns true if a land path exists between two world positions.
 // Uses 4-connected grid at the URES×VRES resolution with a small step size.
-function landPathExists(wx1,wz1,wx2,wz2,h) {
-  // Convert world coords to grid cells
+function landPathExists(wx1,wz1,wx2,wz2,h,MAP,HALF) {
   function toCell(wx,wz){
     return [Math.round((wx+HALF)/MAP*URES), Math.round((wz+HALF)/MAP*VRES)];
   }
@@ -80,28 +85,26 @@ function landPathExists(wx1,wz1,wx2,wz2,h) {
       const idx=nr*(URES+1)+nc;
       if(visited[idx]) continue;
       visited[idx]=1;
-      // Use grid cell centre world position for water check
       const wx=-HALF+nc/URES*MAP, wz=-(HALF-nr/VRES*MAP);
-      if(!isWSafe(wx,wz,h)) queue.push([nc,nr]); // must match unit movement threshold
+      if(!isWSafe(wx,wz,h)) queue.push([nc,nr]);
     }
   }
   return false;
 }
-function getH(wx,wz,h) {
+function getH(wx,wz,h,MAP,HALF) {
   const cx=Math.max(-HALF,Math.min(HALF-0.001,wx)), cz=Math.max(-HALF,Math.min(HALF-0.001,wz));
   const gx=(cx+HALF)/MAP*URES, gz=(cz+HALF)/MAP*VRES;
   const c0=Math.floor(gx),c1=Math.min(c0+1,URES), r0=Math.floor(gz),r1=Math.min(r0+1,VRES);
   const fx=gx-c0,fz=gz-r0;
   return h[r0*(URES+1)+c0]*(1-fx)*(1-fz)+h[r0*(URES+1)+c1]*fx*(1-fz)+h[r1*(URES+1)+c0]*(1-fx)*fz+h[r1*(URES+1)+c1]*fx*fz;
 }
-function isW(wx,wz,h) { return getH(wx,wz,h)<-1.3; }
-// Slightly larger margin for unit movement — keeps units off the shoreline edge
-function isWSafe(wx,wz,h) { return getH(wx,wz,h)<-1.1; }
-function randAround(cx,cz,r0,r1,h,tries=80) {
+function isW(wx,wz,h,MAP,HALF) { return getH(wx,wz,h,MAP,HALF)<-1.3; }
+function isWSafe(wx,wz,h,MAP,HALF) { return getH(wx,wz,h,MAP,HALF)<-1.1; }
+function randAround(cx,cz,r0,r1,h,MAP,HALF,tries=80) {
   for (let i=0;i<tries;i++) {
     const a=Math.random()*Math.PI*2, r=r0+Math.random()*(r1-r0);
     const x=cx+Math.cos(a)*r, z=cz+Math.sin(a)*r;
-    if (Math.abs(x)<HALF-3&&Math.abs(z)<HALF-3&&!isW(x,z,h)) return [x,z];
+    if (Math.abs(x)<HALF-3&&Math.abs(z)<HALF-3&&!isW(x,z,h,MAP,HALF)) return [x,z];
   }
   return [cx+r0,cz];
 }
@@ -146,66 +149,118 @@ function mkUnit(type,x,z,team,ownerId){
   return{id:uid(),type,x,z,team,ownerId,hp:d.hp,maxHp:d.maxHp,atk:d.atk,def:d.def,spd:d.spd,rng:d.rng,vision:d.vision||7,tx:x,tz:z,state:'idle',target:null,gatherTarget:null,returnTC:null,carry:{food:0,wood:0,gold:0,stone:0},atkTimer:0,gatherTimer:0,dead:false,pop:d.pop||1};
 }
 
-function generateMap(pox,poz,aox,aoz){
+function generateMap(spawns, MAP, HALF){
+  // spawns = [[x,z], [x,z], ...] one entry per team
   let seeds=makeSeeds();
-  let h=buildHeights(pox,poz,aox,aoz,seeds);
-  // Guarantee a land path between bases — nudge waterBias up until one exists
+  let h=buildHeights(spawns,seeds,MAP,HALF);
+  // Guarantee a land path between every pair of bases
   let pathAttempts=0;
-  while(!landPathExists(pox,poz,aox,aoz,h)&&pathAttempts<50){
-    seeds={...seeds,waterBias:seeds.waterBias+0.15};
-    h=buildHeights(pox,poz,aox,aoz,seeds);
-    pathAttempts++;
+  outer: while(pathAttempts<60){
+    for(let i=0;i<spawns.length;i++) for(let j=i+1;j<spawns.length;j++){
+      if(!landPathExists(spawns[i][0],spawns[i][1],spawns[j][0],spawns[j][1],h,MAP,HALF)){
+        seeds={...seeds,waterBias:seeds.waterBias+0.15};
+        h=buildHeights(spawns,seeds,MAP,HALF);
+        pathAttempts++;
+        continue outer;
+      }
+    }
+    break;
   }
-  if(pathAttempts>0) console.log(`[map] Raised waterBias ${pathAttempts}x to ensure land path (final bias: ${seeds.waterBias.toFixed(2)})`);
+  if(pathAttempts>0) console.log(`[map] Raised waterBias ${pathAttempts}x to ensure land paths (final bias: ${seeds.waterBias.toFixed(2)})`);
+
+  const isLarge=MAP>200;
   const rn=[];
-  const SAFE_R=14;
   function addR(type,x,z,extra={}){
     const amount=type==='gold'?400+Math.random()*400:type==='stone'?600+Math.random()*400:type==='wood'?300+Math.random()*300:200+Math.random()*200;
     rn.push({id:uid(),type,x,z,amount,maxAmount:amount,depleted:false,...extra});
   }
-  // Named deposits near bases
-  for(const[bx,bz]of[[pox,poz],[aox,aoz]]){
-    // 3 gold + 3 food near each base (1.5× original 2)
-    addR('gold',...randAround(bx,bz,7,16,h));addR('gold',...randAround(bx,bz,7,16,h));addR('gold',...randAround(bx,bz,12,20,h));
-    addR('food',...randAround(bx,bz,6,14,h));addR('food',...randAround(bx,bz,6,14,h));addR('food',...randAround(bx,bz,10,18,h));
-    // 15 trees near each base (1.5× original 10)
-    for(let i=0;i<15;i++){const[tx,tz]=randAround(bx,bz,9,22,h);addR('wood',tx,tz,{isTree:true,variety:Math.random()<0.35?1:0});}
+  // Resources near each base
+  for(const[bx,bz] of spawns){
+    addR('gold',...randAround(bx,bz,7,16,h,MAP,HALF));
+    addR('gold',...randAround(bx,bz,7,16,h,MAP,HALF));
+    addR('gold',...randAround(bx,bz,12,20,h,MAP,HALF));
+    addR('food',...randAround(bx,bz,6,14,h,MAP,HALF));
+    addR('food',...randAround(bx,bz,6,14,h,MAP,HALF));
+    addR('food',...randAround(bx,bz,10,18,h,MAP,HALF));
+    for(let i=0;i<15;i++){const[tx,tz]=randAround(bx,bz,9,22,h,MAP,HALF);addR('wood',tx,tz,{isTree:true,variety:Math.random()<0.35?1:0});}
   }
-  // Scattered deposits — all 1.5× original counts
-  for(let i=0;i<12;i++){const x=(Math.random()-0.5)*MAP*0.85,z=(Math.random()-0.5)*MAP*0.85;if(!isW(x,z,h)&&dist2D(x,z,pox,poz)>14&&dist2D(x,z,aox,aoz)>14)addR('gold',x,z);}
-  for(let i=0;i<15;i++){const x=(Math.random()-0.5)*MAP*0.85,z=(Math.random()-0.5)*MAP*0.85;if(!isW(x,z,h))addR('stone',x,z);}
-  for(let i=0;i<18;i++){const x=(Math.random()-0.5)*MAP*0.85,z=(Math.random()-0.5)*MAP*0.85;if(!isW(x,z,h))addR('food',x,z);}
-  // Trees across the map — 195 total (1.5× original 130)
+  // Scattered deposits — double counts on large map
+  const goldScatter  = isLarge?24:12;
+  const stoneScatter = isLarge?30:15;
+  const foodScatter  = isLarge?36:18;
+  const treeTarget   = isLarge?390:195;
+  for(let i=0;i<goldScatter;i++){
+    const x=(Math.random()-0.5)*MAP*0.85,z=(Math.random()-0.5)*MAP*0.85;
+    if(!isW(x,z,h,MAP,HALF)&&spawns.every(([sx,sz])=>dist2D(x,z,sx,sz)>14)) addR('gold',x,z);
+  }
+  for(let i=0;i<stoneScatter;i++){const x=(Math.random()-0.5)*MAP*0.85,z=(Math.random()-0.5)*MAP*0.85;if(!isW(x,z,h,MAP,HALF))addR('stone',x,z);}
+  for(let i=0;i<foodScatter;i++){const x=(Math.random()-0.5)*MAP*0.85,z=(Math.random()-0.5)*MAP*0.85;if(!isW(x,z,h,MAP,HALF))addR('food',x,z);}
   let attempts=0;
-  while(rn.filter(r=>r.isTree).length<195&&attempts<4000){
+  while(rn.filter(r=>r.isTree).length<treeTarget&&attempts<8000){
     attempts++;
     const x=(Math.random()-0.5)*MAP*0.92,z=(Math.random()-0.5)*MAP*0.92;
-    if(isW(x,z,h))continue;
+    if(isW(x,z,h,MAP,HALF))continue;
     if(rn.some(r=>r.isTree&&dist2D(r.x,r.z,x,z)<2.0))continue;
     addR('wood',x,z,{isTree:true,variety:Math.random()<0.3?1:0});
   }
   return{heights:h,resNodes:rn,seeds};
 }
 
-function createLobby(name,hostId){
+function createLobby(name,hostId,playerCount=2){
   const id=uuidv4().slice(0,6).toUpperCase();
-  const a1=Math.random()*Math.PI*2, a2=a1+Math.PI+(Math.random()-0.5)*0.4, R=45;
-  const pox=Math.round(Math.cos(a1)*R),poz=Math.round(Math.sin(a1)*R);
-  const aox=Math.round(Math.cos(a2)*R),aoz=Math.round(Math.sin(a2)*R);
-  const{heights,resNodes}=generateMap(pox,poz,aox,aoz);
-  const teams={1:mkTeam(),2:mkTeam()};
+  const numPlayers=Math.max(2,Math.min(4,playerCount));
+  const MAP=numPlayers>=3?MAP_LARGE:MAP_SMALL;
+  const HALF=numPlayers>=3?HALF_LARGE:HALF_SMALL;
+
+  // Place spawns evenly around a circle, one per team
+  const R=Math.round(MAP*0.30); // radius ~45 for small, ~90 for large
+  const spawns=[];
+  const baseAngle=Math.random()*Math.PI*2;
+  for(let t=0;t<numPlayers;t++){
+    const a=baseAngle+(t/numPlayers)*Math.PI*2;
+    spawns.push([Math.round(Math.cos(a)*R), Math.round(Math.sin(a)*R)]);
+  }
+
+  const{heights,resNodes}=generateMap(spawns,MAP,HALF);
+
+  const teams={};
+  for(let t=1;t<=numPlayers;t++) teams[t]=mkTeam();
   const units={},buildings={};
+  const tcIds={};
 
-  function sb(type,x,z,team,ownerId){const b=mkBuilding(type,x,z,team,ownerId||('team'+team));buildings[b.id]=b;if(type==='House')teams[team].maxPop+=5;return b;}
-  const tc1=sb('Town Center',pox,poz,1);sb('House',pox-8,poz-4,1);sb('House',pox-8,poz+4,1);sb('Lumbercamp',pox+6,poz-6,1);
-  const tc2=sb('Town Center',aox,aoz,2);sb('House',aox+8,aoz-4,2);sb('House',aox+8,aoz+4,2);
+  function sb(type,x,z,team,ownerId){
+    const b=mkBuilding(type,x,z,team,ownerId||('team'+team));
+    buildings[b.id]=b;
+    if(type==='House') teams[team].maxPop+=5;
+    return b;
+  }
+  function su(type,x,z,team,owner){
+    const u=mkUnit(type,x,z,team,owner||('team'+team));
+    units[u.id]=u;teams[team].population+=u.pop;return u;
+  }
 
-  function su(type,x,z,team,owner){const u=mkUnit(type,x,z,team,owner);units[u.id]=u;teams[team].population+=u.pop;return u;}
-  su('Villager',pox-3,poz-3,1,'team1');su('Villager',pox-3,poz,1,'team1');su('Villager',pox-3,poz+3,1,'team1');su('Scout',pox+3,poz,1,'team1');
-  su('Villager',aox-4,aoz-3,2,'team2');su('Villager',aox-4,aoz,2,'team2');su('Villager',aox-4,aoz+3,2,'team2');su('Scout',aox+3,aoz,2,'team2');
+  // Starting buildings and units for each team
+  const startingDir=[[1,-1],[1,-1],[-1,-1],[-1,1]]; // offset directions
+  for(let t=1;t<=numPlayers;t++){
+    const[sx,sz]=spawns[t-1];
+    const[dx,dz]=startingDir[t-1]||[1,-1];
+    const tc=sb('Town Center',sx,sz,t);
+    tcIds[t]=tc.id;
+    sb('House',sx+dx*8,sz+dz*4,t);
+    sb('House',sx+dx*8,sz-dz*4,t);
+    sb('Lumbercamp',sx-dx*6,sz+dz*6,t);
+    su('Villager',sx+dx*3,sz-3,t);
+    su('Villager',sx+dx*3,sz,  t);
+    su('Villager',sx+dx*3,sz+3,t);
+    su('Scout',   sx-dx*3,sz,  t);
+  }
 
-  return{id,name,hostId,status:'waiting',players:{},aiPlayers:{},
-    gs:{units,buildings,teams,resNodes,heights,pox,poz,aox,aoz,gameTime:0,tc1:tc1.id,tc2:tc2.id,events:[],projPool:[],incomeTimer:0},
+  // Build the gs.spawnPositions array (index = team-1)
+  const spawnPositions=spawns.map(([x,z])=>({x,z}));
+
+  return{id,name,hostId,status:'waiting',players:{},aiPlayers:{},numPlayers,MAP,HALF,
+    gs:{units,buildings,teams,resNodes,heights,spawnPositions,
+        gameTime:0,tcIds,events:[],projPool:[],incomeTimer:0},
     aiState:{},
     tickInterval:null};
 }
@@ -250,15 +305,16 @@ function gameTick(lobby){
   }
   // ── END DIAGNOSTICS ───────────────────────────────────────────────────────
 
-  function iW(x,z){return isW(x,z,heights);}
-  function gH(x,z){return getH(x,z,heights);}
+  const MAP=lobby.MAP, HALF=lobby.HALF;
+
+  function iW(x,z){return isW(x,z,heights,MAP,HALF);}
+  function gH(x,z){return getH(x,z,heights,MAP,HALF);}
 
   function moveU(u,tx,tz){
-    // Guard: if unit has NaN position, teleport it back to a safe spawn point
     if(!isFinite(u.x)||!isFinite(u.z)){
       console.log(`[NaN_RESCUE] unit ${u.id} type=${u.type} owner=${u.ownerId} state=${u.state} — resetting position`);
-      const sx=u.team===1?gs.pox:gs.aox, sz=u.team===1?gs.poz:gs.aoz;
-      u.x=sx+(Math.random()-0.5)*6; u.z=sz+(Math.random()-0.5)*6;
+      const sp=gs.spawnPositions[u.team-1]||{x:0,z:0};
+      u.x=sp.x+(Math.random()-0.5)*6; u.z=sp.z+(Math.random()-0.5)*6;
       u.tx=u.x; u.tz=u.z; u.state='idle'; return true;
     }
     if(!isFinite(tx)||!isFinite(tz)){u.tx=u.x;u.tz=u.z;return true;}
@@ -266,8 +322,8 @@ function gameTick(lobby){
     if(d<0.15)return true;
     const step=Math.min(u.spd*60*dt,d);
     let nx=u.x+(dx/d)*step,nz=u.z+(dz/d)*step;
-    if(!isFinite(nx)||!isFinite(nz)){return false;} // discard bad result
-    if(isWSafe(nx,nz,heights)){let mv=false;const ba=Math.atan2(dx,dz);for(let i=1;i<=8&&!mv;i++)for(const s of[1,-1]){const a=ba+s*i*(Math.PI/8),cx=u.x+Math.sin(a)*step,cz=u.z+Math.cos(a)*step;if(!isWSafe(cx,cz,heights)){nx=cx;nz=cz;mv=true;break;}}if(!mv)return false;}
+    if(!isFinite(nx)||!isFinite(nz)){return false;}
+    if(isWSafe(nx,nz,heights,MAP,HALF)){let mv=false;const ba=Math.atan2(dx,dz);for(let i=1;i<=8&&!mv;i++)for(const s of[1,-1]){const a=ba+s*i*(Math.PI/8),cx=u.x+Math.sin(a)*step,cz=u.z+Math.cos(a)*step;if(!isWSafe(cx,cz,heights,MAP,HALF)){nx=cx;nz=cz;mv=true;break;}}if(!mv)return false;}
     u.x=nx;u.z=nz;return false;
   }
 
@@ -276,8 +332,8 @@ function gameTick(lobby){
     const u=units[id];if(u.dead)continue;
     if(!isFinite(u.x)||!isFinite(u.z)){
       console.log(`[NaN_DETECTED] BEFORE_TICK id=${id} type=${u.type} owner=${u.ownerId} state=${u.state} x=${u.x} z=${u.z} tx=${u.tx} tz=${u.tz} gameTime=${gs.gameTime.toFixed(1)}`);
-      const sx=u.team===1?gs.pox:gs.aox, sz=u.team===1?gs.poz:gs.aoz;
-      u.x=sx+(Math.random()-0.5)*6; u.z=sz+(Math.random()-0.5)*6;
+      const sp=gs.spawnPositions[u.team-1]||{x:0,z:0};
+      u.x=sp.x+(Math.random()-0.5)*6; u.z=sp.z+(Math.random()-0.5)*6;
       u.tx=u.x; u.tz=u.z; u.state='idle';
     }
     if(!isFinite(u.tx)||!isFinite(u.tz)){
@@ -342,7 +398,7 @@ function gameTick(lobby){
     if(u._returning&&u.state==='idle'){u._returning=false;}
 
     switch(u.state){
-      case 'moving':case 'attack_move':if(moveU(u,u.tx,u.tz))u.state='idle';break;
+      case 'moving':case 'attack_move':if(moveU(u,u.tx,u.tz)){u.state='idle';}break;
       case 'moving_to_attack':{
         moveU(u,u.tx,u.tz);
         for(const oid in units){const o=units[oid];if(!o.dead&&o.team!==u.team&&dist2D(u.x,u.z,o.x,o.z)<8){u.target=oid;u.state='attacking';break;}}
@@ -462,11 +518,18 @@ function gameTick(lobby){
       const az2=Math.max(-HALF+1,Math.min(HALF-1,a.z+nz*overlap*aShare));
       const bx2=Math.max(-HALF+1,Math.min(HALF-1,b.x-nx*overlap*bShare));
       const bz2=Math.max(-HALF+1,Math.min(HALF-1,b.z-nz*overlap*bShare));
-      if(!isWSafe(ax2,az2,heights)){a.x=ax2;a.z=az2;}
-      if(!isWSafe(bx2,bz2,heights)){b.x=bx2;b.z=bz2;}
+      if(!isWSafe(ax2,az2,heights,MAP,HALF)){a.x=ax2;a.z=az2;}
+      if(!isWSafe(bx2,bz2,heights,MAP,HALF)){b.x=bx2;b.z=bz2;}
     }
   }
   } // end every-other-tick separation
+
+  // ─ Blacksmith cooldown tick ─
+  for(const bid in buildings){
+    const b=buildings[bid];
+    if(b.dead||b.type!=='Blacksmith'||!b.smithCooldown)continue;
+    b.smithCooldown=Math.max(0,b.smithCooldown-dt);
+  }
 
   // ─ Tower autofire ─
   for(const bid in buildings){
@@ -550,7 +613,7 @@ function gameTick(lobby){
   gs.incomeTimer+=dt;
   if(gs.incomeTimer>=5){
     gs.incomeTimer=0;
-    for(const t of[1,2]){
+    for(const t of Object.keys(teams).map(Number)){
       const fa=(teams[t].researched||[]).includes('Horse Collar')?12:8;
       for(const b of Object.values(buildings)){
         if(b.dead||b.underConstruction||b.team!==t) continue;
@@ -564,39 +627,44 @@ function gameTick(lobby){
           teams[t].food=Math.min(9999,(teams[t].food||0)+fa);
           gs.events.push({type:'farm_income',res:'food',amt:fa,x:b.x,z:b.z,team:t});
         } else if(b.type==='Lumbercamp'){
-          teams[t].wood=Math.min(9999,(teams[t].wood||0)+5);
-          gs.events.push({type:'farm_income',res:'wood',amt:5,x:b.x,z:b.z,team:t});
+          teams[t].wood=Math.min(9999,(teams[t].wood||0)+1);
+          gs.events.push({type:'farm_income',res:'wood',amt:1,x:b.x,z:b.z,team:t});
         }
       }
     }
   }
 
   // ─ AI players ─
-  const aiCtx={uid,UDEFS,BCOSTS,BHPS,BSIZES,MAP,HALF,URES,VRES,resMap:gs._resMap||new Map(),pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz};
+  const aiCtx={uid,UDEFS,BCOSTS,BHPS,BSIZES,MAP,HALF,URES,VRES,resMap:gs._resMap||new Map(),
+    spawnPositions:gs.spawnPositions,
+    // legacy 2-player compat fields — AI reads these for its own/enemy spawn
+    pox:gs.spawnPositions[0]?.x||0,poz:gs.spawnPositions[0]?.z||0,
+    aox:gs.spawnPositions[1]?.x||0,aoz:gs.spawnPositions[1]?.z||0};
   for(const[team,aiP] of Object.entries(lobby.aiPlayers||{})){
     tickAIPlayer(lobby, dt, Number(team), aiP.difficulty, aiCtx);
   }
 
   // ─ Score ─
-  teams[1].score+=dt*0.5;teams[2].score+=dt*0.5;
+  for(const tn of Object.keys(teams).map(Number)) teams[tn].score+=dt*0.5;
 
-  // ─ Win check — TC is dead if missing from buildings (deleted) OR flagged dead ─
-  const b1=buildings[gs.tc1],b2=buildings[gs.tc2];
-  if(!b1||b1.dead){endGame(lobby,2);return;}
-  if(!b2||b2.dead){endGame(lobby,1);return;}
+  // ─ Win check — last team with a living TC wins ─
+  const aliveTeams=Object.entries(gs.tcIds).filter(([tn,bid])=>{
+    const b=buildings[bid]; return b&&!b.dead;
+  }).map(([tn])=>Number(tn));
+  if(aliveTeams.length===1){endGame(lobby,aliveTeams[0]);return;}
+  if(aliveTeams.length===0){endGame(lobby,0);return;} // draw (shouldn't happen)
 
   // ─ Water rescue — pull any unit that drifted into water back to safe land ─
   for(const id in units){
     const u=units[id];
-    if(u.dead||!isW(u.x,u.z,heights)) continue;
-    // Unit is in water — find nearest dry cell by spiralling outward
+    if(u.dead||!isW(u.x,u.z,heights,MAP,HALF)) continue;
     let rescued=false;
     for(let r=1;r<=8&&!rescued;r++){
       for(let dx2=-r;dx2<=r&&!rescued;dx2++){
         for(let dz2=-r;dz2<=r&&!rescued;dz2++){
-          if(Math.abs(dx2)<r&&Math.abs(dz2)<r) continue; // only check perimeter
+          if(Math.abs(dx2)<r&&Math.abs(dz2)<r) continue;
           const tx2=u.x+dx2*1.0, tz2=u.z+dz2*1.0;
-          if(!isWSafe(tx2,tz2,heights)){u.x=tx2;u.z=tz2;u.state='idle';rescued=true;}
+          if(!isWSafe(tx2,tz2,heights,MAP,HALF)){u.x=tx2;u.z=tz2;u.state='idle';rescued=true;}
         }
       }
     }
@@ -610,40 +678,28 @@ function gameTick(lobby){
   // ─ Prune dead — include dead units in this tick's delta so clients remove them ─
   if(!gs._unitSnap) gs._unitSnap={};
   for(const id in units){
-    if(units[id].dead){
-      // Force into delta so client sees the death
-      gs._unitSnap[id]=null; // null forces re-send
-    }
+    if(units[id].dead) gs._unitSnap[id]=null;
   }
   for(const id in units)if(units[id].dead)delete units[id];
-  // Projectiles are spawn-event only — client manages full lifecycle
 
   const unitsDelta={};
   if(!gs._unitSnap) gs._unitSnap={};
   for(const[id,u] of Object.entries(units)){
     const snap=gs._unitSnap[id];
-    // Only include unit if meaningful change since last tick.
-    // Use a 0.05 threshold for position to absorb float jitter from separation nudges.
     if(snap&&Math.abs(snap.x-u.x)<0.05&&Math.abs(snap.z-u.z)<0.05
         &&Math.abs((snap.tx||0)-(u.tx||0))<0.05&&Math.abs((snap.tz||0)-(u.tz||0))<0.05
-        &&snap.hp===u.hp&&snap.state===u.state){
-      continue; // unchanged — skip it this tick
+        &&snap.hp===u.hp&&snap.state===u.state&&snap.armored===u.armored){
+      continue;
     }
     const qx=Math.round(u.x*10)/10,qz=Math.round(u.z*10)/10,qtx=u.tx!=null?Math.round(u.tx*10)/10:null,qtz=u.tz!=null?Math.round(u.tz*10)/10:null;
-    unitsDelta[id]={id:u.id,x:qx,z:qz,tx:qtx,tz:qtz,hp:u.hp,mh:u.maxHp,s:STATE_ENC[u.state]||u.state,tm:u.team,t:u.type,p:u.pop};
-    gs._unitSnap[id]={x:u.x,z:u.z,hp:u.hp,state:u.state,tx:u.tx,tz:u.tz};
+    unitsDelta[id]={id:u.id,x:qx,z:qz,tx:qtx,tz:qtz,hp:u.hp,mh:u.maxHp,s:STATE_ENC[u.state]||u.state,tm:u.team,t:u.type,p:u.pop,ar:u.armored||false,atk:u.atk,def:u.def,spd:u.spd,rng:u.rng,vi:u.vision};
+    gs._unitSnap[id]={x:u.x,z:u.z,hp:u.hp,state:u.state,tx:u.tx,tz:u.tz,armored:u.armored};
   }
-  // Include units that just died and clean up all stale snap entries
   for(const id of Object.keys(gs._unitSnap)){
-    if(gs._unitSnap[id]===null){
-      unitsDelta[id]={id,dead:true};
-      delete gs._unitSnap[id];
-    } else if(!units[id]){
-      // Unit is gone but snap wasn't nulled (edge case) — clean up silently
-      delete gs._unitSnap[id];
-    }
+    if(gs._unitSnap[id]===null){unitsDelta[id]={id,dead:true};delete gs._unitSnap[id];}
+    else if(!units[id])delete gs._unitSnap[id];
   }
-  // ─ Buildings sparse delta ─────────────────────────────────────────────────────
+  // ─ Buildings sparse delta ─
   if(!gs._bldSnap) gs._bldSnap={};
   const bldsDelta={};
   for(const[id,b] of Object.entries(buildings)){
@@ -651,20 +707,22 @@ function gameTick(lobby){
     const snap=gs._bldSnap[id];
     const pqStr=b.productionQueue.join(',');
     const bp=Math.round(b.buildProgress*10)/10;
+    const sc=Math.ceil(b.smithCooldown||0);
     if(snap&&snap.hp===b.hp&&snap.pq===pqStr&&snap.uc===b.underConstruction
-       &&Math.abs(snap.bp-bp)<0.05&&snap.rx===b.rallyX&&snap.rz===b.rallyZ) continue;
+       &&Math.abs(snap.bp-bp)<0.05&&snap.rx===b.rallyX&&snap.rz===b.rallyZ&&snap.sc===sc) continue;
     const isNew=!snap;
     bldsDelta[id]=isNew
       ?{id:b.id,x:b.x,z:b.z,hp:b.hp,mh:b.maxHp,t:b.type,tm:b.team,sz:b.size,
         pq:b.productionQueue,dead:false,uc:b.underConstruction,bp,bt:b.buildTime,
-        rx:b.rallyX,rz:b.rallyZ,ri:b.rallyResourceId}
-      :{id:b.id,hp:b.hp,pq:b.productionQueue,uc:b.underConstruction,bp,rx:b.rallyX,rz:b.rallyZ};
-    gs._bldSnap[id]={hp:b.hp,pq:pqStr,uc:b.underConstruction,bp,rx:b.rallyX,rz:b.rallyZ};
+        rx:b.rallyX,rz:b.rallyZ,ri:b.rallyResourceId,sc}
+      :{id:b.id,hp:b.hp,pq:b.productionQueue,uc:b.underConstruction,bp,rx:b.rallyX,rz:b.rallyZ,sc};
+    gs._bldSnap[id]={hp:b.hp,pq:pqStr,uc:b.underConstruction,bp,rx:b.rallyX,rz:b.rallyZ,sc};
   }
   for(const id of Object.keys(gs._bldSnap)){if(!buildings[id])delete gs._bldSnap[id];}
-  // Remove dead buildings except the two TCs (win check needs to find them)
+  // Remove dead buildings except TCs (win check needs them)
+  const allTcIds=new Set(Object.values(gs.tcIds));
   for(const id in buildings){
-    if(buildings[id].dead&&id!==gs.tc1&&id!==gs.tc2){
+    if(buildings[id].dead&&!allTcIds.has(id)){
       if(buildings[id].type==='Farm'&&buildings[id].farmNodeId){
         const fn=gs.resNodes.find(r=>r.id===buildings[id].farmNodeId);
         if(fn){fn.depleted=true;gs._resMapDirty=true;}
@@ -672,9 +730,12 @@ function gameTick(lobby){
       delete buildings[id];
     }
   }
-  // Teams — short keys
+  // Teams — all active teams
   const teamsOut={};
-  for(const tn of[1,2]){const t=teams[tn];teamsOut[tn]={f:Math.floor(t.food||0),w:Math.floor(t.wood||0),g:Math.floor(t.gold||0),s:Math.floor(t.stone||0),p:t.population||0,mp:t.maxPop||0,sc:Math.floor(t.score||0),a:t.age||0,re:t.researched||[]};}
+  for(const tn of Object.keys(teams).map(Number)){
+    const t=teams[tn];
+    teamsOut[tn]={f:Math.floor(t.food||0),w:Math.floor(t.wood||0),g:Math.floor(t.gold||0),s:Math.floor(t.stone||0),p:t.population||0,mp:t.maxPop||0,sc:Math.floor(t.score||0),a:t.age||0,re:t.researched||[]};
+  }
   // Resource nodes delta — short key
   const resNodesDelta=gs.resNodes.filter(r=>!r.depleted).map(r=>({id:r.id,a:Math.round(r.amount*10)/10}));
   // Projectiles: spawn events only — client tracks lifetime
@@ -707,46 +768,59 @@ io.on('connection',socket=>{
   });
 
   socket.on('getLobbies',()=>{
-    socket.emit('lobbiesList',Object.values(lobbies).map(l=>({id:l.id,name:l.name,status:l.status,playerCount:Object.keys(l.players).length,maxPlayers:4})));
+    socket.emit('lobbiesList',Object.values(lobbies).map(l=>({id:l.id,name:l.name,status:l.status,playerCount:Object.keys(l.players).length,maxPlayers:l.numPlayers||2})));
   });
 
-  socket.on('createLobby',({lobbyName})=>{
+  socket.on('createLobby',({lobbyName,playerCount})=>{
     const p=players[socket.id];if(!p)return;
-    const lobby=createLobby(lobbyName||`${p.name}'s Realm`,socket.id);
+    const np=Math.max(2,Math.min(4,Number(playerCount)||2));
+    const lobby=createLobby(lobbyName||`${p.name}'s Realm`,socket.id,np);
     lobbies[lobby.id]=lobby;p.lobbyId=lobby.id;p.team=1;lobby.players[socket.id]=p;
     socket.join(lobby.id);
     const gs=lobby.gs;
+    const f32h=new Float32Array(gs.heights);
+    const heightsB64=Buffer.from(f32h.buffer).toString('base64');
     socket.emit('lobbyJoined',{lobbyId:lobby.id,team:1,isHost:true,players:getLobbyPlayers(lobby),
-      mapData:{heights:Array.from(gs.heights),resNodes:gs.resNodes,pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz},
+      mapData:{heightsB64,resNodes:gs.resNodes,spawnPositions:gs.spawnPositions,mapSize:lobby.MAP},
       initialState:{units:gs.units,buildings:gs.buildings,teams:gs.teams}});
-    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby)});
+    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby),numPlayers:lobby.numPlayers});
   });
 
-  socket.on('joinLobby',({lobbyId,team})=>{
+  socket.on('joinLobby',({lobbyId})=>{
     const p=players[socket.id];if(!p)return;
     const lobby=lobbies[lobbyId];
     if(!lobby||lobby.status!=='waiting'){socket.emit('error',{message:'Lobby unavailable'});return;}
-    if(Object.keys(lobby.players).length>=4){socket.emit('error',{message:'Lobby full'});return;}
-    const t1=Object.values(lobby.players).filter(x=>x.team===1).length;
-    const t2=Object.values(lobby.players).filter(x=>x.team===2).length;
-    let assignedTeam=(t1<=t2)?1:2;
-    if(t1>=2)assignedTeam=2;if(t2>=2)assignedTeam=1;
+    if(Object.keys(lobby.players).length>=lobby.numPlayers){socket.emit('error',{message:'Lobby full'});return;}
+    // Assign the team slot with the fewest human players
+    const counts={};
+    for(let t=1;t<=lobby.numPlayers;t++) counts[t]=0;
+    for(const pl of Object.values(lobby.players)) counts[pl.team]=(counts[pl.team]||0)+1;
+    // Skip teams that already have an AI
+    let assignedTeam=1;
+    let minCount=Infinity;
+    for(let t=1;t<=lobby.numPlayers;t++){
+      if(lobby.aiPlayers&&lobby.aiPlayers[t]) continue; // AI occupies this team
+      if((counts[t]||0)<minCount){minCount=counts[t]||0;assignedTeam=t;}
+    }
     if(p.lobbyId){const ol=lobbies[p.lobbyId];if(ol)delete ol.players[socket.id];socket.leave(p.lobbyId);}
     p.lobbyId=lobby.id;p.team=assignedTeam;lobby.players[socket.id]=p;socket.join(lobby.id);
     const gs=lobby.gs;
     const f32h2=new Float32Array(gs.heights);
     const hB64=Buffer.from(f32h2.buffer).toString('base64');
     socket.emit('lobbyJoined',{lobbyId:lobby.id,team:p.team,isHost:lobby.hostId===socket.id,players:getLobbyPlayers(lobby),
-      mapData:{heightsB64:hB64,resNodes:gs.resNodes,pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz},
+      mapData:{heightsB64:hB64,resNodes:gs.resNodes,spawnPositions:gs.spawnPositions,mapSize:lobby.MAP},
       initialState:{units:gs.units,buildings:gs.buildings,teams:gs.teams}});
-    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby)});
+    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby),numPlayers:lobby.numPlayers});
   });
 
   socket.on('switchTeam',({team})=>{
     const p=players[socket.id];if(!p||!p.lobbyId)return;
     const lobby=lobbies[p.lobbyId];if(!lobby||lobby.status!=='waiting')return;
-    if(Object.values(lobby.players).filter(x=>x.team===team&&x.id!==socket.id).length>=2){socket.emit('error',{message:'Team full'});return;}
-    p.team=team;io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby)});
+    const t=Number(team);
+    if(t<1||t>lobby.numPlayers){socket.emit('error',{message:'Invalid team'});return;}
+    if(lobby.aiPlayers&&lobby.aiPlayers[t]){socket.emit('error',{message:'That team has an AI'});return;}
+    if(Object.values(lobby.players).filter(x=>x.team===t&&x.id!==socket.id).length>=1){socket.emit('error',{message:'Team full'});return;}
+    p.team=t;io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby),numPlayers:lobby.numPlayers});
   });
 
   socket.on('startGame',()=>{
@@ -764,13 +838,12 @@ io.on('connection',socket=>{
       if(teamToSocket[b.team]) b.ownerId=teamToSocket[b.team];
       else if(lobby.aiPlayers[b.team]) b.ownerId='ai_team_'+b.team;
     }
-    // Encode height array as base64 Float32 — ~33KB instead of ~89KB as JSON
     const f32h=new Float32Array(gs.heights);
     const heightsB64=Buffer.from(f32h.buffer).toString('base64');
     for(const[sid,pl] of Object.entries(lobby.players)){
       io.to(sid).emit('gameStarted',{
         units:gs.units,buildings:gs.buildings,teams:gs.teams,team:pl.team,
-        mapData:{heightsB64,resNodes:gs.resNodes,pox:gs.pox,poz:gs.poz,aox:gs.aox,aoz:gs.aoz}
+        mapData:{heightsB64,resNodes:gs.resNodes,spawnPositions:gs.spawnPositions,mapSize:lobby.MAP}
       });
     }
     lobby.lastTick=Date.now();
@@ -818,7 +891,7 @@ io.on('connection',socket=>{
     else if(cmd.type==='build'){
       const t=teams[p.team],cost=BCOSTS[cmd.buildType];if(!cost)return;
       if(!afford(t,cost)){socket.emit('error',{message:'Not enough resources'});return;}
-      if(isW(cmd.x,cmd.z,gs.heights)){socket.emit('error',{message:'Cannot build on water!'});return;}
+      if(isW(cmd.x,cmd.z,gs.heights,lobby.MAP,lobby.HALF)){socket.emit('error',{message:'Cannot build on water!'});return;}
       spend(t,cost);
       // Building starts under construction — villagers must walk there and build it
       const b=mkBuilding(cmd.buildType,cmd.x,cmd.z,p.team,socket.id,true);
@@ -843,7 +916,6 @@ io.on('connection',socket=>{
       spend(t,def.cost);b.productionQueue.push(cmd.unitType);
     }
     else if(cmd.type==='trade'){
-      // Require a live, completed Market owned by this team
       const hasMarket=Object.values(buildings).some(b=>!b.dead&&!b.underConstruction&&b.type==='Market'&&b.team===p.team);
       if(!hasMarket){socket.emit('error',{message:'You need a Market to trade!'});return;}
       const t=teams[p.team];
@@ -851,20 +923,35 @@ io.on('connection',socket=>{
       if(!TRADEABLE.includes(cmd.res)){socket.emit('error',{message:'Invalid resource'});return;}
       const AMT=100;
       if(cmd.action==='sell'){
-        // Sell 100 of a resource for 60 gold (60% rate)
         if((t[cmd.res]||0)<AMT){socket.emit('error',{message:`Not enough ${cmd.res} to sell!`});return;}
         t[cmd.res]-=AMT;
         t.gold=Math.min(9999,(t.gold||0)+60);
         gs.events.push({type:'trade',action:'sell',res:cmd.res,amt:AMT,gold:60,team:p.team});
       } else if(cmd.action==='buy'){
-        // Buy 100 of a resource for 160 gold (160% rate)
         if((t.gold||0)<160){socket.emit('error',{message:'Not enough gold to buy!'});return;}
         t.gold-=160;
         t[cmd.res]=Math.min(9999,(t[cmd.res]||0)+AMT);
         gs.events.push({type:'trade',action:'buy',res:cmd.res,amt:AMT,gold:160,team:p.team});
-      } else {
-        socket.emit('error',{message:'Invalid trade action'});return;
-      }
+      } else {socket.emit('error',{message:'Invalid trade action'});return;}
+    }
+    else if(cmd.type==='smith'){
+      // Armor a nearby military unit at the blacksmith — unit must already be close
+      const SMITH_RANGE=5.0;
+      const SMITH_COOLDOWN=60;
+      const bs=buildings[cmd.buildingId];
+      if(!bs||bs.dead||bs.underConstruction||bs.type!=='Blacksmith'||bs.team!==p.team){socket.emit('error',{message:'Invalid Blacksmith'});return;}
+      if((bs.smithCooldown||0)>0){socket.emit('error',{message:`Blacksmith cooling down — ${Math.ceil(bs.smithCooldown)}s remaining`});return;}
+      const u=units[cmd.unitId];
+      if(!u||u.dead||u.ownerId!==socket.id){socket.emit('error',{message:'Invalid unit'});return;}
+      if(u.type==='Villager'||u.type==='Scout'){socket.emit('error',{message:'Only military units can be armored'});return;}
+      if(u.armored){socket.emit('error',{message:'Unit is already armored'});return;}
+      const dx=u.x-bs.x, dz=u.z-bs.z;
+      if(Math.sqrt(dx*dx+dz*dz)>SMITH_RANGE){socket.emit('error',{message:'Unit is too far from the Blacksmith!'});return;}
+      const baseDef=UDEFS[u.type]?.def||0;
+      u.def=baseDef+1;
+      u.armored=true;
+      bs.smithCooldown=SMITH_COOLDOWN;
+      gs.events.push({msg:`${u.type} armored at Blacksmith!`,type:'good',team:p.team});
     }
     else if(cmd.type==='research'){
       const tech=TECHS.find(x=>x.id===cmd.techId);if(!tech)return;
@@ -889,13 +976,14 @@ io.on('connection',socket=>{
     const lobby=lobbies[p.lobbyId];
     if(!lobby||lobby.status!=='waiting'||lobby.hostId!==socket.id)return;
     const t=Number(team);
+    if(t<1||t>lobby.numPlayers){socket.emit('error',{message:'Invalid team number'});return;}
     if(Object.values(lobby.players).some(pl=>pl.team===t)){
       socket.emit('error',{message:'That team already has a human player'});return;
     }
     if(!['easy','moderate','hard'].includes(difficulty)) return;
     if(!lobby.aiPlayers) lobby.aiPlayers={};
     lobby.aiPlayers[t]={difficulty};
-    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby)});
+    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby),numPlayers:lobby.numPlayers});
   });
 
   socket.on('removeAI',({team})=>{
@@ -903,7 +991,7 @@ io.on('connection',socket=>{
     const lobby=lobbies[p.lobbyId];
     if(!lobby||lobby.status!=='waiting'||lobby.hostId!==socket.id)return;
     if(lobby.aiPlayers) delete lobby.aiPlayers[Number(team)];
-    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby)});
+    io.to(lobby.id).emit('lobbyUpdate',{players:getLobbyPlayers(lobby),numPlayers:lobby.numPlayers});
   });
 
   socket.on('chatMessage',({text})=>{

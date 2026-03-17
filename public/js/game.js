@@ -5,9 +5,21 @@
 //  ported from Age of Conquest II reference game
 // ═══════════════════════════════════════════════════════════════
 
-const MAP = 150, HALF = 75;
+// MAP and HALF are set dynamically when mapData arrives (150/75 for 2p, 300/150 for 3-4p)
+let MAP = 150, HALF = 75;
 const URES = 90, VRES = 90;
 const WATER_LEVEL = -1.3;
+
+// Team colours and names — supports up to 4 teams
+const TEAM_COLORS = {1:'#4a90d9', 2:'#e05c44', 3:'#4caa44', 4:'#c8a820'};
+const TEAM_EMOJIS = {1:'⚔', 2:'🔥', 3:'🌿', 4:'✨'};
+const TEAM_NAMES  = {1:'BLUE',  2:'RED',   3:'GREEN', 4:'GOLD'};
+// Hex colour values for Three.js meshes
+const TEAM_HEX    = {1:0x2a3870, 2:0x702a2a, 3:0x2a6030, 4:0x705a10};
+const TEAM_HEX_ALT= {1:0x2a5a30, 2:0x5a2a20, 3:0x3a6020, 4:0x706010};
+
+// All spawn positions received from server — index = team-1
+let allSpawns = [{x:0,z:0},{x:0,z:0}];
 
 // ── Socket ────────────────────────────────────────────────────
 const socket = io();
@@ -18,6 +30,7 @@ let gameStarted = false;
 
 // ── Terrain / Map data (received from server) ─────────────────
 let terrHeights = null;
+// Legacy 2-player spawn aliases — kept for buildEnvironment compat
 let P_OX = 0, P_OZ = 0, AI_OX = 0, AI_OZ = 0;
 
 // ── Game state (mirrored from server) ─────────────────────────
@@ -62,6 +75,9 @@ let _rallyFlag = null;   // THREE.Mesh (flag marker at rally point)
 // ── Build ghost ───────────────────────────────────────────────
 let ghostState = null;
 
+// ── Smith mode (click-to-armor) ───────────────────────────────
+let smithMode = null; // { buildingId, bx, bz } while waiting for unit click
+
 // ── Event log ─────────────────────────────────────────────────
 const evLog = [];
 
@@ -70,9 +86,10 @@ let renderer, scene, camera, terrain, waterMesh, waterMat;
 let sun, fillLight, sky;
 
 // ── FOW ───────────────────────────────────────────────────────
-const FOW_RES = 256, FOW_CELLS = 240, FOW_CELL = MAP / FOW_CELLS;
-const fow    = new Uint8Array(FOW_CELLS * FOW_CELLS);   // integer state: 0=dark,1=shroud,2=visible
-const fowVis = new Float32Array(FOW_CELLS * FOW_CELLS); // float level: 0.0=dark, 0.5=shroud, 1.0=visible
+const FOW_RES = 256, FOW_CELLS = 240;
+let FOW_CELL = MAP / FOW_CELLS;   // recomputed in initFOW() when MAP is set
+const fow    = new Uint8Array(FOW_CELLS * FOW_CELLS);
+const fowVis = new Float32Array(FOW_CELLS * FOW_CELLS);
 const fowPixels = new Uint8Array(FOW_RES * FOW_RES * 4);
 let fowTexture = null, fowOrthoScene = null, fowOrthoCamera = null, fowQuadMat = null;
 let fowTimer = 0;
@@ -171,6 +188,18 @@ function fowReveal(wx,wz,radiusWorld){
     fow[idx]=2; // integer state for game logic queries
   }
 }
+// Call once per game start — recomputes FOW_CELL for the current map size
+// and clears any state left over from a previous game.
+function initFOW(){
+  FOW_CELL = MAP / FOW_CELLS;
+  fow.fill(0);
+  fowVis.fill(0);
+  fowPixels.fill(0);
+  // Tear down old Three.js FOW objects so initFOWPlane rebuilds them fresh
+  if(fowTexture){ fowTexture.dispose(); fowTexture=null; }
+  if(fowQuadMat){ fowQuadMat.dispose(); fowQuadMat=null; }
+  fowOrthoScene=null; fowOrthoCamera=null;
+}
 function initFOWPlane(){
   fowTexture=new THREE.DataTexture(fowPixels,FOW_RES,FOW_RES,THREE.RGBAFormat);
   fowTexture.magFilter=THREE.LinearFilter;
@@ -260,10 +289,10 @@ function tickFOW(dt){
     }
     fowReveal(rx,rz,u.vision||7);
   }
-  // Reveal from my buildings
+  // Reveal from my buildings — only completed buildings grant vision
   for(const id in serverBuildings){
     const b=serverBuildings[id];
-    if(b.team!==myTeam) continue;
+    if(b.team!==myTeam||b.underConstruction) continue;
     fowReveal(b.x,b.z,BLDG_VISION[b.type]||7);
   }
   updateFOWTexture();
@@ -429,18 +458,10 @@ function makeRock(x,z){
 }
 function buildEnvironment(){
   const SAFE_R=14;
-  function randAround(cx,cz,rMin,rMax,tries=80){
-    for(let i=0;i<tries;i++){
-      const a=Math.random()*Math.PI*2,r=rMin+Math.random()*(rMax-rMin);
-      const x=cx+Math.cos(a)*r,z=cz+Math.sin(a)*r;
-      if(Math.abs(x)<HALF-3&&Math.abs(z)<HALF-3&&!isWater(x,z)) return [x,z];
-    }
-    return [cx+rMin,cz];
-  }
   // Rocks  (trees are now server-side wood resource nodes)
   for(let i=0;i<40;i++){
     const x=(Math.random()-0.5)*MAP*0.88,z=(Math.random()-0.5)*MAP*0.88;
-    if(Math.hypot(x-P_OX,z-P_OZ)<SAFE_R||Math.hypot(x-AI_OX,z-AI_OZ)<SAFE_R||isWater(x,z)) continue;
+    if(allSpawns.some(sp=>Math.hypot(x-sp.x,z-sp.z)<SAFE_R)||isWater(x,z)) continue;
     makeRock(x,z);
   }
 }
@@ -533,14 +554,15 @@ const STONE_C=0x9a9490, WOOD_C=0x7a5028, THATCH_C=0x8a7040;
 
 function buildMesh_TownCenter(team){
   const g=new THREE.Group();
-  const tc=team===1?'player':'enemy';
+  const capC=TEAM_HEX[team]||0x2244aa;
+  const bannerC=TEAM_HEX[team]||0x2a4ecc, bannerE=(TEAM_HEX[team]||0x2a4ecc)-0x112222;
   const found=makePBRBox(6.5,0.4,6.5,0x8a8070,0.95);found.position.y=0.2;g.add(found);
   const keep=makePBRBox(5,3,5,STONE_C,0.85);keep.position.y=1.9;g.add(keep);
   for(let mx=-2;mx<=2;mx++) for(const mz of[-2.5,2.5]){if(Math.abs(mx)===1)continue;const m=makePBRBox(0.5,0.5,0.4,0x8a8070,0.9);m.position.set(mx,3.65,mz);g.add(m);}
   for(let mz=-2;mz<=2;mz++) for(const mx of[-2.5,2.5]){if(Math.abs(mz)===1)continue;const m=makePBRBox(0.4,0.5,0.5,0x8a8070,0.9);m.position.set(mx,3.65,mz);g.add(m);}
   for(const [tx,tz] of[[-2.2,-2.2],[2.2,-2.2],[-2.2,2.2],[2.2,2.2]]){
     const t=makePBRCyl(0.65,0.7,4.5,10,STONE_C-0x050505,0.85);t.position.set(tx,2.25,tz);g.add(t);
-    const cap=makePBRCyl(0,0.75,0.8,10,tc==='player'?0x2244aa:0xaa2222,0.8);cap.position.set(tx,4.8,tz);g.add(cap);
+    const cap=makePBRCyl(0,0.75,0.8,10,capC,0.8);cap.position.set(tx,4.8,tz);g.add(cap);
     const ring=makePBRCyl(0.68,0.68,0.35,10,0x7a7468,0.9);ring.position.set(tx,4.35,tz);g.add(ring);
   }
   const gateL=makePBRBox(0.4,2.2,0.5,0x888070,0.9);gateL.position.set(-0.6,1.5,2.5);g.add(gateL);
@@ -548,14 +570,13 @@ function buildMesh_TownCenter(team){
   const gateTop=makePBRBox(1.6,0.5,0.5,0x888070,0.9);gateTop.position.set(0,2.7,2.5);g.add(gateTop);
   const door=makePBRBox(0.9,1.9,0.1,0x1e0e04,0.99);door.position.set(0,1.15,2.56);g.add(door);
   const pole=makePBRCyl(0.04,0.04,2.5,5,0x2a1a08,0.9);pole.position.set(0,5.25,0);g.add(pole);
-  const bannerC=tc==='player'?0x2a4ecc:0xcc2a2a, bannerE=tc==='player'?0x2244aa:0xaa2222;
   const banner=makePBRBox(0.7,0.5,0.04,bannerC,0.8,0,bannerE,0.5);banner.position.set(0.35,5.9,0);g.add(banner);
   const roof=makePBRBox(4.8,0.25,4.8,STONE_C+0x050505,0.9);roof.position.y=3.52;g.add(roof);
   return g;
 }
 function buildMesh_Barracks(team){
   const g=new THREE.Group();
-  const c=team===1?0x2a3870:0x702a2a;
+  const c=TEAM_HEX[team]||0x2a3870;
   const found=makePBRBox(5,0.3,3.5,0x8a8070,0.95);found.position.y=0.15;g.add(found);
   const walls=makePBRBox(4.2,2.4,3,WOOD_C,0.85);walls.position.y=1.35;g.add(walls);
   const roof=makePBRBox(4.6,0.2,3.4,0x5a3810,0.9);roof.position.y=2.65;g.add(roof);
@@ -569,7 +590,7 @@ function buildMesh_Barracks(team){
 }
 function buildMesh_House(team){
   const g=new THREE.Group();
-  const wc=team===1?0xc09858:0xa07040;
+  const wc=team===1?0xc09858:team===2?0xa07040:team===3?0x88a050:0xb09040;
   const found=makePBRBox(2.8,0.25,2.8,0x8a8070,0.95);found.position.y=0.12;g.add(found);
   const walls=makePBRBox(2.4,1.8,2.4,wc,0.85);walls.position.y=1.05;g.add(walls);
   const roofMat=new THREE.MeshStandardMaterial({color:THATCH_C,roughness:0.95});
@@ -601,7 +622,7 @@ function buildMesh_Tower(team){
   for(const [bx,bz] of[[-0.75,0],[0.75,0],[0,-0.75],[0,0.75]]){const b=makePBRBox(0.3,0.5,0.3,0x8a8878,0.9);b.position.set(bx,5.7,bz);g.add(b);}
   for(const [ax,az] of[[0,-0.96],[0,0.96],[-0.96,0],[0.96,0]]){const slit=makePBRBox(0.12,0.55,0.05,0x0a0604,0.99);slit.position.set(ax,3.5,az);g.add(slit);}
   const pole=makePBRCyl(0.03,0.03,1.5,5,0x2a1a08,0.9);pole.position.set(0,6.2,0);g.add(pole);
-  const flagC=team===1?0x3344cc:0xcc3333, flagE=team===1?0x2233aa:0xaa2222;
+  const flagC=TEAM_HEX[team]||0x3344cc, flagE=(TEAM_HEX[team]||0x3344cc)-0x111122;
   const flag=makePBRBox(0.45,0.3,0.04,flagC,0.7,0,flagE,0.4);flag.position.set(0.22,6.8,0);g.add(flag);
   return g;
 }
@@ -636,7 +657,7 @@ function buildMesh_MiningCamp(){
 }
 function buildMesh_Castle(team){
   const g=new THREE.Group();
-  const ac=team===1?0x2a4ecc:0xcc2a2a;
+  const ac=TEAM_HEX[team]||0x2a4ecc;
   const found=makePBRBox(9,0.45,9,0x8a8070,0.95);found.position.y=0.22;g.add(found);
   const main=makePBRBox(7,4,7,STONE_C,0.85);main.position.y=2.45;g.add(main);
   for(let bx=-3;bx<=3;bx+=1.2) for(const bz of[-3.5,3.5]){const m=makePBRBox(0.5,0.5,0.4,0x8a8878,0.9);m.position.set(bx,4.7,bz);g.add(m);}
@@ -658,7 +679,7 @@ function buildMesh_Castle(team){
 }
 function buildMesh_Market(team){
   const g=new THREE.Group();
-  const c=team===1?0xd4a020:0xa02020;
+  const c=TEAM_HEX[team]||0xd4a020;
   const found=makePBRBox(4.5,0.25,3.5,0x8a8070,0.95);found.position.y=0.12;g.add(found);
   const walls=makePBRBox(3.8,2,2.8,0xc8a868,0.82);walls.position.y=1.15;g.add(walls);
   const awning=makePBRBox(5,0.12,1.5,c,0.75);awning.position.set(0,2.3,-1.8);g.add(awning);
@@ -805,6 +826,90 @@ function makeUnitMesh_Scout(team){
   return g;
 }
 
+// ── Per-unit armored recolour ─────────────────────────────────
+// Each function rebuilds only the colour-changing parts; skin/hair/metal
+// weapon pieces stay identical so the unit is still recognisable.
+const _steel      = 0x9a9aaa; // polished steel — armored torso/limb plates
+const _darkSteel  = 0x3a3a48; // darker steel — secondary plates
+const _crimson    = 0x8a1010; // deep crimson — team colour replacement on armor
+const _chainmail  = 0x4a4a52; // dark chainmail grey
+const _slate      = 0x48484e; // slate grey legs
+
+function applyArmorSkin(grp, unitType, team){
+  // First, boost metalness/shininess on ALL existing meshes slightly
+  // so even unchanged pieces look like they've been upgraded
+  grp.traverse(c=>{
+    if(!c.isMesh||!c.material||c.material.isMeshBasicMaterial) return;
+    const m=c.material.clone();
+    m.metalness=Math.max(m.metalness||0, 0.35);
+    m.roughness=Math.min(m.roughness||0.9, 0.55);
+    c.material=m;
+  });
+
+  // Collect child meshes in spawn order (same order as the make* functions)
+  const meshes=[];
+  grp.traverse(c=>{if(c.isMesh&&!c.material?.isMeshBasicMaterial)meshes.push(c);});
+
+  function recolour(mesh, hex, metalness=0.7, roughness=0.2, emissiveHex=0x111822, emissInt=0.12){
+    if(!mesh) return;
+    const m=mesh.material.clone();
+    m.color=new THREE.Color(hex);
+    m.metalness=metalness; m.roughness=roughness;
+    m.emissive=new THREE.Color(emissiveHex); m.emissiveIntensity=emissInt;
+    mesh.material=m;
+  }
+
+  if(unitType==='Swordsman'){
+    // meshes: 0=torso(steel), 1=coat(mc/blue), 2=legL, 3=legR,
+    //         4=helmet, 5=visor, 6=hilt, 7=blade, 8=shield, 9=boss
+    recolour(meshes[0], _steel,     0.8, 0.18); // torso — brighter steel
+    recolour(meshes[1], _crimson,   0.5, 0.45, 0x440000, 0.15); // coat → crimson
+    recolour(meshes[2], _slate,     0.7, 0.25); // leg L → slate steel
+    recolour(meshes[3], _slate,     0.7, 0.25); // leg R → slate steel
+    recolour(meshes[4], _steel,     0.85,0.15); // helmet → bright steel
+    // shield gets crimson face to match coat
+    recolour(meshes[8], _crimson,   0.4, 0.5,  0x440000, 0.2);
+  } else if(unitType==='Archer'){
+    // meshes: 0=torso(leather), 1=hood(mc/green), 2=legL, 3=legR,
+    //         4=head(skin), 5=cap(mc/green), 6=bow, 7=bowStr, 8=quiver
+    recolour(meshes[0], _chainmail, 0.65,0.30); // leather torso → chainmail
+    recolour(meshes[1], _crimson,   0.45,0.55, 0x440000, 0.15); // green hood → crimson
+    recolour(meshes[2], _slate,     0.6, 0.35); // brown legs → slate
+    recolour(meshes[3], _slate,     0.6, 0.35);
+    recolour(meshes[5], _crimson,   0.45,0.55, 0x440000, 0.15); // green cap → crimson
+  } else if(unitType==='Knight'){
+    // meshes: 0=hBody(horse torso), 1=hNeck, 2=hHead,
+    //         3-6=horse legs, 7=torso(steel), 8=surcoat(mc/blue),
+    //         9=helm, 10=lance, 11=tip
+    recolour(meshes[0], _darkSteel, 0.6, 0.40); // horse body → dark steel
+    recolour(meshes[1], _darkSteel, 0.6, 0.40); // horse neck
+    recolour(meshes[2], _darkSteel, 0.6, 0.40); // horse head
+    recolour(meshes[3], _darkSteel, 0.6, 0.40); // horse legs x4
+    recolour(meshes[4], _darkSteel, 0.6, 0.40);
+    recolour(meshes[5], _darkSteel, 0.6, 0.40);
+    recolour(meshes[6], _darkSteel, 0.6, 0.40);
+    recolour(meshes[7], _steel,     0.85,0.15); // rider torso → bright steel
+    recolour(meshes[8], _crimson,   0.45,0.5,  0x440000, 0.18); // surcoat → crimson
+    recolour(meshes[9], _steel,     0.88,0.12); // helm → mirror steel
+  } else if(unitType==='Catapult'){
+    // meshes: 0=base(wood frame), 1-8=wheels+spokes x4,
+    //         9=arm, 10=counterweight, 11=cup, 12=rock, 13=stripe(mc/green)
+    // Replace wood tones with dark iron/charcoal, stripe goes iron red
+    recolour(meshes[0],  0x2e2e2e, 0.55,0.5);  // frame → charred iron
+    for(let i=1;i<=8;i++) recolour(meshes[i], 0x252525, 0.6, 0.4); // wheels/spokes
+    recolour(meshes[9],  0x2e2e2e, 0.55,0.5);  // arm
+    recolour(meshes[10], 0x222222, 0.6, 0.35); // counterweight
+    recolour(meshes[11], 0x2e2e2e, 0.55,0.5);  // cup
+    recolour(meshes[13], 0x6a1010, 0.5, 0.6,  0x330000, 0.2); // stripe → iron red
+  }
+
+  // Shared finishing touch: shiny steel shoulder pauldrons added to all armored units
+  const pauldronMat=new THREE.MeshStandardMaterial({color:_steel,metalness:0.9,roughness:0.12,emissive:new THREE.Color(0x223344),emissiveIntensity:0.2});
+  for(const sx of[-0.28,0.28]){
+    const p=new THREE.Mesh(new THREE.SphereGeometry(0.13,7,5),pauldronMat);
+    p.scale.set(1,0.7,1);p.position.set(sx,0.75,0);p.castShadow=true;grp.add(p);
+  }
+}
 function spawnUnitMesh(u){
   let grp;
   switch(u.type){
@@ -815,6 +920,7 @@ function spawnUnitMesh(u){
     case 'Catapult':  grp=makeUnitMesh_Catapult(u.team);  break;
     default:          grp=makeUnitMesh_Scout(u.team);     break;
   }
+  if(u.armored) applyArmorSkin(grp, u.type, u.team);
   // Selection ring
   const selRing=new THREE.Mesh(new THREE.RingGeometry(0.65,0.85,18),new THREE.MeshBasicMaterial({color:u.team===myTeam?0x5ddb5d:0xff4444,side:THREE.DoubleSide,transparent:true,opacity:0.8}));
   selRing.rotation.x=-Math.PI/2;selRing.position.y=0.02;selRing.visible=false;
@@ -877,14 +983,14 @@ function drawMinimap(){
   for(const id in serverBuildings){
     const b=serverBuildings[id];
     if(b.team!==myTeam&&fowCell(b.x,b.z)===0) continue;
-    mmX.fillStyle=b.team===myTeam?'#4488ff':'#ff4422';
+    mmX.fillStyle=b.team===myTeam?'#4488ff':(TEAM_COLORS[b.team]||'#ff4422');
     const s=b.size*3;mmX.fillRect(sx(b.x)-s/2,sz(b.z)-s/2,s,s);
   }
   // Units
   for(const id in serverUnits){
     const u=serverUnits[id];
     if(u.team!==myTeam&&fowCell(u.x,u.z)!==2) continue;
-    mmX.fillStyle=u.team===myTeam?'#88ff66':'#ff6644';
+    mmX.fillStyle=u.team===myTeam?'#88ff66':(TEAM_COLORS[u.team]||'#ff6644');
     mmX.fillRect(sx(u.x)-1.5,sz(u.z)-1.5,3,3);
   }
   drawMinimapFOW();
@@ -958,7 +1064,7 @@ function setupMouse(){
   const canvas=document.getElementById('canvas');
   canvas.addEventListener('mousedown',e=>{
     if(e.button===0){if(ghostState)return;isDrag=true;dragS={x:e.clientX,y:e.clientY};}
-    if(e.button===2){e.preventDefault();if(ghostState){cancelBuildMode();return;}handleRMB(e);}
+    if(e.button===2){e.preventDefault();if(ghostState){cancelBuildMode();return;}if(smithMode){cancelSmithMode();return;}handleRMB(e);}
   });
   canvas.addEventListener('mousemove',e=>{
     if(ghostState){
@@ -982,6 +1088,7 @@ function setupMouse(){
     if(e.button!==0)return;
     selBox.style.display='none';
     if(ghostState){const wp=getWorldClick(e);if(wp)commitBuild(wp.x,wp.z);return;}
+    if(smithMode){handleSmithClick(e);return;}
     const dx=e.clientX-dragS.x,dy=e.clientY-dragS.y;
     if(Math.abs(dx)<6&&Math.abs(dy)<6)handleLMBClick(e);
     else handleDragSel(dragS,{x:e.clientX,y:e.clientY});
@@ -1016,16 +1123,34 @@ function handleLMBClick(e){
   mpos.set((e.clientX/innerWidth)*2-1,-(e.clientY/innerHeight)*2+1);
   ray.setFromCamera(mpos,camera);
   let hit=false;
-  for(const id in unitMeshes){
-    const u=serverUnits[id];if(!u||u.team!==myTeam)continue;
-    const b3=new THREE.Box3().setFromObject(unitMeshes[id]);b3.expandByScalar(0.3);
-    if(ray.ray.intersectsBox(b3)){if(!e.shiftKey)deselAll();selUnit(id);hit=true;break;}
+  // Check units — own team first, then visible enemies
+  for(const pass of[0,1]){
+    if(hit)break;
+    for(const id in unitMeshes){
+      const u=serverUnits[id];if(!u)continue;
+      const isOwn=u.team===myTeam;
+      if(pass===0&&!isOwn)continue;
+      if(pass===1&&isOwn)continue;
+      if(pass===1&&fowCell(u.x,u.z)!==2)continue; // enemy must be in visible FOW
+      const mesh=unitMeshes[id];if(!mesh||!mesh.visible)continue;
+      const b3=new THREE.Box3().setFromObject(mesh);b3.expandByScalar(0.3);
+      if(ray.ray.intersectsBox(b3)){if(!e.shiftKey)deselAll();selUnit(id);hit=true;break;}
+    }
   }
   if(!hit){
-    for(const id in buildingMeshes){
-      const b=serverBuildings[id];if(!b||b.team!==myTeam)continue;
-      const b3=new THREE.Box3().setFromObject(buildingMeshes[id]);
-      if(ray.ray.intersectsBox(b3)){if(!e.shiftKey)deselAll();selBuilding(id);hit=true;break;}
+    // Check buildings — own team first, then visible enemies
+    for(const pass of[0,1]){
+      if(hit)break;
+      for(const id in buildingMeshes){
+        const b=serverBuildings[id];if(!b)continue;
+        const isOwn=b.team===myTeam;
+        if(pass===0&&!isOwn)continue;
+        if(pass===1&&isOwn)continue;
+        if(pass===1&&fowCell(b.x,b.z)<1)continue; // enemy must be at least in shroud
+        const mesh=buildingMeshes[id];if(!mesh||!mesh.visible)continue;
+        const b3=new THREE.Box3().setFromObject(mesh);
+        if(ray.ray.intersectsBox(b3)){if(!e.shiftKey)deselAll();selBuilding(id);hit=true;break;}
+      }
     }
   }
   // Check resource nodes (visible ones only)
@@ -1236,8 +1361,9 @@ function syncGameState(state){
   // ─ Teams ─
   serverTeams=teams||{};
   const myT=serverTeams[myTeam]||{};
-  const enemyTeam=myTeam===1?2:1;
-  const enemyT=serverTeams[enemyTeam]||{};
+  // For AI panel, show first team that isn't ours
+  const enemyTeamNum=Object.keys(serverTeams).map(Number).find(t=>t!==myTeam)||( myTeam===1?2:1);
+  const enemyT=serverTeams[enemyTeamNum]||{};
   updateResUI(myT);
   updateAIPanel(enemyT);
 
@@ -1294,12 +1420,19 @@ function syncGameState(state){
     if(d.t!==undefined&&typeof d.t==='string') delta.type=d.t;
     if(d.mh!==undefined) delta.maxHp=d.mh;
     if(d.p!==undefined) delta.pop=d.p;
+    if(d.ar!==undefined) delta.armored=d.ar;
+    if(d.atk!==undefined) delta.atk=d.atk;
+    if(d.def!==undefined) delta.def=d.def;
+    if(d.spd!==undefined) delta.spd=d.spd;
+    if(d.rng!==undefined) delta.rng=d.rng;
+    if(d.vi!==undefined) delta.vision=d.vi;
 
     if(delta.dead){
       if(serverUnits[id]) serverUnits[id].dead=true;
       else serverUnits[id]=delta;
     } else if(serverUnits[id]){
       const u=serverUnits[id];
+      const wasArmored=u.armored;
       if(delta.x!==undefined) u.x=delta.x;
       if(delta.z!==undefined) u.z=delta.z;
       if(delta.tx!==undefined) u.tx=delta.tx;
@@ -1308,6 +1441,20 @@ function syncGameState(state){
       if(delta.maxHp!==undefined) u.maxHp=delta.maxHp;
       if(delta.state!==undefined) u.state=delta.state;
       if(delta.pop!==undefined) u.pop=delta.pop;
+      if(delta.armored!==undefined) u.armored=delta.armored;
+      if(delta.atk!==undefined) u.atk=delta.atk;
+      if(delta.def!==undefined) u.def=delta.def;
+      if(delta.spd!==undefined) u.spd=delta.spd;
+      if(delta.rng!==undefined) u.rng=delta.rng;
+      if(delta.vision!==undefined) u.vision=delta.vision;
+      // Rebuild mesh if unit just became armored
+      if(!wasArmored&&u.armored&&unitMeshes[id]){
+        const oldPos=unitMeshes[id].position.clone();
+        const oldRot=unitMeshes[id].rotation.y;
+        scene.remove(unitMeshes[id]);delete unitMeshes[id];
+        spawnUnitMesh(u);
+        if(unitMeshes[id]){unitMeshes[id].position.copy(oldPos);unitMeshes[id].rotation.y=oldRot;}
+      }
     } else {
       serverUnits[id]=delta;
     }
@@ -1380,6 +1527,8 @@ function syncGameState(state){
     if(raw.rx!==undefined) b.rallyX=raw.rx;
     if(raw.rz!==undefined) b.rallyZ=raw.rz;
     if(raw.ri!==undefined) b.rallyResourceId=raw.ri;
+    if(raw.sc!==undefined) b.smithCooldown=raw.sc;
+    // Merge into existing serverBuilding entry (preserve static fields not in delta)
     if(b.dead){
       // Building was destroyed this tick — fire death effect and remove mesh
       if(buildingMeshes[id]){
@@ -1389,11 +1538,10 @@ function syncGameState(state){
       }
       delete serverBuildings[id];
     } else {
-      // Live building — merge delta into existing entry (preserves static fields not in sparse delta),
-      // or store as new entry if we've never seen this building before.
+      // Live building — merge delta into existing entry or store as new
       if(serverBuildings[id]) Object.assign(serverBuildings[id],b);
       else serverBuildings[id]=b;
-      const sb=serverBuildings[id];
+      const sb=serverBuildings[id]; // full merged object — always has maxHp, type, size etc.
       if(!buildingMeshes[id])spawnBuildingMesh(sb);
       const mesh=buildingMeshes[id];if(!mesh)continue;
       // Construction animation
@@ -1539,14 +1687,27 @@ function refreshSelUI(){
     const id=selectedUnitIds[0],u=serverUnits[id];
     if(!u)return;
     const def=UNIT_DEFS[u.type]||{};
+    // Server only sends atk/def/spd/rng on unit creation; use live value if present, else UNIT_DEFS
+    const atk  = u.atk  !== undefined ? u.atk  : def.atk  || 0;
+    const udef = u.def  !== undefined ? u.def  : def.def  || 0;
+    const spd  = u.spd  !== undefined ? u.spd  : def.spd  || 0;
+    const rng  = u.rng  !== undefined ? u.rng  : def.rng  || 1;
+    const vis  = u.vision!== undefined? u.vision: def.vision||7;
     setEl('sel-portrait',def.icon||'⚔');
-    setEl('sel-name',u.type+(selectedUnitIds.length>1?` ×${selectedUnitIds.length}`:''));
+    const armorTag=u.armored?' 🛡+1':'';
+    setEl('sel-name',u.type+(selectedUnitIds.length>1?` ×${selectedUnitIds.length}`:'')+armorTag);
     setEl('sel-type','Unit · '+(u.team===myTeam?'Ally':'Enemy'));
-    const pct=u.hp/u.maxHp;
+    const pct=(u.hp||0)/(u.maxHp||def.maxHp||1);
     const hp=document.getElementById('sel-hp');if(hp){hp.style.width=(pct*100)+'%';hp.style.background=pct>0.6?'#4cdd4c':pct>0.3?'#ffaa20':'#ee3030';}
-    document.getElementById('sel-stats').innerHTML=`<span class="stat-chip">⚔ ${u.atk}</span><span class="stat-chip">🛡 ${u.def}</span><span class="stat-chip">💨 ${Math.round(u.spd*1000)/10}</span><span class="stat-chip">🎯 ${u.rng?.toFixed(1)||'?'}</span><span class="stat-chip scout">👁 ${u.vision||7}</span>`;
+    document.getElementById('sel-stats').innerHTML=
+      `<span class="stat-chip">❤ ${u.hp||0}/${u.maxHp||def.maxHp||'?'}</span>`+
+      `<span class="stat-chip">⚔ ${atk}</span>`+
+      `<span class="stat-chip">🛡 ${udef}</span>`+
+      `<span class="stat-chip">💨 ${Math.round(spd*1000)/10}</span>`+
+      `<span class="stat-chip">🎯 ${rng.toFixed(1)}</span>`+
+      `<span class="stat-chip">👁 ${vis}</span>`;
     const stMap={idle:'⏸ Standing by',moving:'→ Moving',attacking:'⚔ Attacking!',attacking_building:'🔨 Assaulting!',gathering:'⛏ Gathering',moving_to_gather:'→ To resource',returning:'← Returning',moving_to_attack:'⚔ Marching!',moving_to_build:'→ To site',building:'🔨 Building…'};
-    setEl('sel-status',stMap[u.state]||u.state);
+    setEl('sel-status',stMap[u.state]||u.state||'');
     if(u.team===myTeam){
       addActBtn(panel,'👣','Move',()=>{});
       addActBtn(panel,'⚔','Attack Move',()=>{for(const id of selectedUnitIds){const u=serverUnits[id];if(u)u.state='attack_move';}});
@@ -1567,29 +1728,39 @@ function refreshSelUI(){
     const b=serverBuildings[selectedBuildingId];if(!b)return;
     const icons={'Town Center':'🏰',Barracks:'⚔',House:'🏚',Farm:'🌾',Tower:'🗼',Blacksmith:'⚒',Castle:'🏯',Market:'🏪',Lumbercamp:'🪵',MiningCamp:'⛏'};
     setEl('sel-portrait',icons[b.type]||'🏠');
-    setEl('sel-name',b.type);setEl('sel-type','Building · '+(b.team===myTeam?'Yours':'Enemy'));
-    const pct=b.hp/b.maxHp;
+    setEl('sel-name',b.type);
+    setEl('sel-type','Building · '+(b.team===myTeam?'Yours':'Enemy'));
+    const maxHp=b.maxHp||1;
+    const pct=(b.hp||0)/maxHp;
     const hp=document.getElementById('sel-hp');if(hp){hp.style.width=(pct*100)+'%';hp.style.background=pct>0.6?'#4cdd4c':pct>0.3?'#ffaa20':'#ee3030';}
-    document.getElementById('sel-stats').innerHTML=`<span class="stat-chip">HP ${b.hp||0}/${b.maxHp||1}</span>`;
-    const progTxt=b.underConstruction?`🏗 Building… ${Math.round((b.buildProgress||0)/(b.buildTime||20)*100)}%`:b.productionQueue?.length?`⚒ Training: ${b.productionQueue[0]}`:'⏸ Idle';
+    document.getElementById('sel-stats').innerHTML=
+      `<span class="stat-chip">❤ ${b.hp||0} / ${maxHp}</span>`+
+      `<span class="stat-chip">${Math.round(pct*100)}% HP</span>`;
+    const progTxt=b.underConstruction
+      ?`🏗 Building… ${Math.round((b.buildProgress||0)/(b.buildTime||20)*100)}%`
+      :b.productionQueue?.length?`⚒ Training: ${b.productionQueue[0]}`:'⏸ Idle';
     setEl('sel-status',progTxt);
     if(b.team===myTeam&&!b.underConstruction){
       if(b.type==='Town Center'){
         addActBtn(panel,'👷','Train Villager [V]',()=>trainUnit(b.id,'Villager'),'V');
         addActBtn(panel,'🔬','Research [R]',()=>showTech(),'R');
       } else if(b.type==='Barracks'){
-        addActBtn(panel,'⚔','Train Swordsman [S]',()=>trainUnit(b.id,'Swordsman'),'S');
-        addActBtn(panel,'🏹','Train Archer [A]',()=>trainUnit(b.id,'Archer'),'A');
-        addActBtn(panel,'🏇','Train Scout [O]',()=>trainUnit(b.id,'Scout'),'O');
-        if((myT.age||0)>=1)addActBtn(panel,'🐴','Train Knight [K]',()=>trainUnit(b.id,'Knight'),'K');
-        if((myT.age||0)>=2)addActBtn(panel,'💣','Train Catapult [C]',()=>trainUnit(b.id,'Catapult'),'C');
+        addActBtn(panel,'⚔','Train Swordsman [S] · 60🍖 20💰',()=>trainUnit(b.id,'Swordsman'),'S');
+        addActBtn(panel,'🏹','Train Archer [A] · 25🪵 45💰',()=>trainUnit(b.id,'Archer'),'A');
+        addActBtn(panel,'🏇','Train Scout [O] · 80🍖',()=>trainUnit(b.id,'Scout'),'O');
+        if((myT.age||0)>=1)addActBtn(panel,'🐴','Train Knight [K] · 60🍖 75💰',()=>trainUnit(b.id,'Knight'),'K');
+        if((myT.age||0)>=2)addActBtn(panel,'💣','Train Catapult [C] · 200🪵 100💰',()=>trainUnit(b.id,'Catapult'),'C');
+      } else if(b.type==='Blacksmith'){
+        const cd=b.smithCooldown||0;
+        if(cd>0){
+          addActBtn(panel,'⏳',`Cooling down… ${Math.ceil(cd)}s`,()=>alert2(`Blacksmith cooling down — ${Math.ceil(cd)}s remaining`,true));
+        } else {
+          addActBtn(panel,'⚒','Armor a nearby unit (+1 def)',()=>enterSmithMode(b.id));
+        }
       } else if(b.type==='Market'){
-        const myT=serverTeams[myTeam]||{};
-        // Sell buttons — 100 res → 60 gold
         addActBtn(panel,'🌾→💰','Sell 100 Food for 60 Gold',()=>tradeResource('sell','food'));
         addActBtn(panel,'🪵→💰','Sell 100 Wood for 60 Gold',()=>tradeResource('sell','wood'));
         addActBtn(panel,'🪨→💰','Sell 100 Stone for 60 Gold',()=>tradeResource('sell','stone'));
-        // Buy buttons — 160 gold → 100 res
         addActBtn(panel,'💰→🌾','Buy 100 Food for 160 Gold',()=>tradeResource('buy','food'));
         addActBtn(panel,'💰→🪵','Buy 100 Wood for 160 Gold',()=>tradeResource('buy','wood'));
         addActBtn(panel,'💰→🪨','Buy 100 Stone for 160 Gold',()=>tradeResource('buy','stone'));
@@ -1629,14 +1800,14 @@ function addActBtn(panel,icon,label,fn,key=''){
 }
 function tradeResource(action,res){
   const b=serverBuildings[selectedBuildingId];
-  if(!b||b.type!=="Market"||b.underConstruction){alert2("Select a completed Market!",true);return;}
+  if(!b||b.type!=='Market'||b.underConstruction){alert2('Select a completed Market!',true);return;}
   const t=serverTeams[myTeam];if(!t)return;
-  if(action==="sell"){
-    if((t[res]||0)<100){alert2("Not enough "+res+" to sell!",true);return;}
+  if(action==='sell'){
+    if((t[res]||0)<100){alert2('Not enough '+res+' to sell!',true);return;}
   } else {
-    if((t.gold||0)<160){alert2("Not enough gold to buy!",true);return;}
+    if((t.gold||0)<160){alert2('Not enough gold to buy!',true);return;}
   }
-  socket.emit("cmd",{type:"trade",action,res,buildingId:selectedBuildingId});
+  socket.emit('cmd',{type:'trade',action,res,buildingId:selectedBuildingId});
 }
 function trainUnit(buildingId,type){socket.emit('cmd',{type:'produce',buildingId,unitType:type});}
 
@@ -1663,6 +1834,78 @@ function cancelBuildMode(){
   if(ghostState){scene.remove(ghostState.mesh);ghostState=null;}
   const bc=document.getElementById('build-cursor');if(bc)bc.classList.remove('active');
   const cv=document.getElementById('canvas');if(cv)cv.style.cursor='';
+}
+
+// ── Smith mode ────────────────────────────────────────────────
+const SMITH_RANGE=5.0; // max world-units from blacksmith to unit
+function enterSmithMode(buildingId){
+  const b=serverBuildings[buildingId];
+  if(!b||b.dead||b.underConstruction){alert2('Blacksmith is not ready!',true);return;}
+  cancelBuildMode();
+  smithMode={buildingId,bx:b.x,bz:b.z};
+  document.getElementById('canvas').style.cursor='none';
+  // Show a red crosshair prompt label
+  let lbl=document.getElementById('smith-prompt');
+  if(!lbl){
+    lbl=document.createElement('div');lbl.id='smith-prompt';
+    lbl.style.cssText='position:fixed;top:50%;left:50%;transform:translate(-50%,-200%);'
+      +'background:rgba(180,20,20,0.85);color:#fff;font-family:Cinzel,serif;font-size:0.8rem;'
+      +'padding:6px 14px;border-radius:4px;border:1px solid #ff4444;pointer-events:none;z-index:999;';
+    document.body.appendChild(lbl);
+  }
+  lbl.textContent='🔴 Click a military unit to armor  (RMB or Esc to cancel)';
+  lbl.style.display='block';
+  // Red dot cursor that follows mouse
+  let dot=document.getElementById('smith-cursor');
+  if(!dot){
+    dot=document.createElement('div');dot.id='smith-cursor';
+    dot.style.cssText='position:fixed;width:22px;height:22px;border-radius:50%;'
+      +'border:3px solid #ff2222;background:rgba(255,30,30,0.25);pointer-events:none;'
+      +'transform:translate(-50%,-50%);z-index:1000;display:none;';
+    document.body.appendChild(dot);
+  }
+  dot.style.display='block';
+  const onMove=e=>{dot.style.left=e.clientX+'px';dot.style.top=e.clientY+'px';};
+  document.addEventListener('mousemove',onMove);
+  smithMode._onMove=onMove;
+}
+function cancelSmithMode(){
+  if(!smithMode)return;
+  if(smithMode._onMove)document.removeEventListener('mousemove',smithMode._onMove);
+  smithMode=null;
+  const cv=document.getElementById('canvas');if(cv)cv.style.cursor='';
+  const lbl=document.getElementById('smith-prompt');if(lbl)lbl.style.display='none';
+  const dot=document.getElementById('smith-cursor');if(dot)dot.style.display='none';
+}
+function handleSmithClick(e){
+  if(!smithMode)return;
+  mpos.set((e.clientX/innerWidth)*2-1,-(e.clientY/innerHeight)*2+1);
+  ray.setFromCamera(mpos,camera);
+  let picked=null;
+  for(const id in unitMeshes){
+    const u=serverUnits[id];
+    if(!u||u.dead||u.team!==myTeam)continue;
+    if(u.type==='Villager'||u.type==='Scout')continue;
+    if(u.armored)continue;
+    const b3=new THREE.Box3().setFromObject(unitMeshes[id]);b3.expandByScalar(0.4);
+    if(ray.ray.intersectsBox(b3)){picked=id;break;}
+  }
+  if(!picked){
+    // Clicked empty space — just cancel
+    cancelSmithMode();
+    return;
+  }
+  const u=serverUnits[picked];
+  const dx=u.x-smithMode.bx, dz=u.z-smithMode.bz;
+  const dist=Math.sqrt(dx*dx+dz*dz);
+  if(dist>SMITH_RANGE){
+    alert2(`${u.type} is too far from the Blacksmith! Move it closer first.`,true);
+    cancelSmithMode();
+    return;
+  }
+  socket.emit('cmd',{type:'smith',buildingId:smithMode.buildingId,unitId:picked});
+  logEv(`Armoring ${u.type}…`,'good');
+  cancelSmithMode();
 }
 function commitBuild(wx,wz){
   if(!ghostState)return;
@@ -1796,7 +2039,7 @@ function onKeyDown(e){
   if(!gameStarted)return;
   if(document.getElementById('tech-pop')?.style.display==='block'){if(e.key==='Escape')closeTech();return;}
   const k=e.key.toLowerCase();
-  if(k==='escape'){cancelBuildMode();deselAll();}
+  if(k==='escape'){cancelBuildMode();cancelSmithMode();deselAll();}
   if(selectedBuildingId){
     const b=serverBuildings[selectedBuildingId];if(b&&b.team===myTeam){
       if(k==='v'&&b.type==='Town Center')trainUnit(b.id,'Villager');
@@ -1847,14 +2090,16 @@ function refreshLobbies(){socket.emit('getLobbies');}
 function createLobby(){
   const inp=document.getElementById('lobby-name-input');
   const name=inp?.value.trim()||`${myName}'s Realm`;
-  socket.emit('createLobby',{lobbyName:name});
+  const pcSel=document.getElementById('player-count-select');
+  const playerCount=pcSel?Number(pcSel.value):2;
+  socket.emit('createLobby',{lobbyName:name,playerCount});
 }
 function joinByCode(){
   const inp=document.getElementById('join-id-input');
   const code=inp?.value.trim().toUpperCase();
   const err=document.getElementById('join-error');
   if(!code){if(err)err.textContent='Enter a room code';return;}
-  socket.emit('joinLobby',{lobbyId:code,team:1});
+  socket.emit('joinLobby',{lobbyId:code});
 }
 function switchTeam(t){socket.emit('switchTeam',{team:t});}
 function startGame(){socket.emit('startGame');}
@@ -1877,6 +2122,19 @@ socket.on('connect',()=>{console.log('Connected');});
 socket.on('nameSet',({id})=>{
   myId=id;
   const nl=document.getElementById('lobby-player-name');if(nl)nl.textContent=myName;
+  // Inject player-count selector next to the create lobby button if not already present
+  if(!document.getElementById('player-count-select')){
+    const createBtn=document.querySelector('[onclick="createLobby()"]')||document.getElementById('btn-create-lobby');
+    if(createBtn){
+      const SEL_STYLE='background:rgba(20,12,3,0.9);border:1px solid #6b4f10;color:#f0d06a;font-family:\'Cinzel\',serif;font-size:0.72rem;padding:4px 7px;border-radius:3px;cursor:pointer;margin-right:6px;';
+      const wrap=document.createElement('span');
+      wrap.style.cssText='display:inline-flex;align-items:center;margin-right:6px;';
+      wrap.innerHTML=`<label style="color:#6a4a18;font-family:'Cinzel',serif;font-size:0.68rem;margin-right:4px;text-transform:uppercase;letter-spacing:0.1em;">Players</label>`
+        +`<select id="player-count-select" style="${SEL_STYLE}">`
+        +`<option value="2">2</option><option value="3">3</option><option value="4">4</option></select>`;
+      createBtn.parentNode.insertBefore(wrap,createBtn);
+    }
+  }
   socket.emit('getLobbies');
   showScreen('screen-lobby');
 });
@@ -1887,12 +2145,12 @@ socket.on('lobbiesList',lobbies=>{
   list.innerHTML=lobbies.map(l=>`
     <div class="lobby-item" onclick="joinLobby('${l.id}')">
       <div><div class="lobby-item-name">${l.name}</div><div class="lobby-item-info">${l.status==='playing'?'In Progress':'Waiting'}</div></div>
-      <div style="display:flex;align-items:center;gap:8px;"><span style="color:#a08040;font-size:0.78rem;">${l.playerCount}/4</span><span class="btn-sm" style="pointer-events:none;">${l.status==='waiting'?'JOIN':'WATCH'}</span></div>
+      <div style="display:flex;align-items:center;gap:8px;"><span style="color:#a08040;font-size:0.78rem;">${l.playerCount}/${l.maxPlayers||4}</span><span class="btn-sm" style="pointer-events:none;">${l.status==='waiting'?'JOIN':'WATCH'}</span></div>
     </div>`).join('');
 });
-window.joinLobby=function(id){socket.emit('joinLobby',{lobbyId:id,team:1});};
+window.joinLobby=function(id){socket.emit('joinLobby',{lobbyId:id});};
 
-socket.on('lobbyJoined',({lobbyId,team,isHost:ih,players,mapData,initialState})=>{
+socket.on('lobbyJoined',({lobbyId,team,isHost:ih,players,mapData,initialState,numPlayers})=>{
   currentLobbyId=lobbyId;myTeam=Number(team);isHost=ih;
   if(mapData&&mapData.heightsB64&&!mapData.heights){
     const buf=Uint8Array.from(atob(mapData.heightsB64),c=>c.charCodeAt(0)).buffer;
@@ -1900,45 +2158,78 @@ socket.on('lobbyJoined',({lobbyId,team,isHost:ih,players,mapData,initialState})=
   }
   const rc=document.getElementById('room-code-display');if(rc)rc.textContent=lobbyId;
   if(mapData){
-    terrHeights=mapData.heights;P_OX=mapData.pox;P_OZ=mapData.poz;AI_OX=mapData.aox;AI_OZ=mapData.aoz;
+    terrHeights=mapData.heights;
+    if(mapData.mapSize){MAP=mapData.mapSize;HALF=MAP/2;}
+    if(mapData.spawnPositions){
+      allSpawns=mapData.spawnPositions;
+      P_OX=allSpawns[0]?.x||0; P_OZ=allSpawns[0]?.z||0;
+      AI_OX=allSpawns[1]?.x||0; AI_OZ=allSpawns[1]?.z||0;
+    } else if(mapData.pox!=null){
+      // legacy fallback
+      P_OX=mapData.pox;P_OZ=mapData.poz;AI_OX=mapData.aox;AI_OZ=mapData.aoz;
+      allSpawns=[{x:P_OX,z:P_OZ},{x:AI_OX,z:AI_OZ}];
+    }
     if(initialState){serverUnits=initialState.units||{};serverBuildings=initialState.buildings||{};serverTeams=initialState.teams||{};}
     if(mapData.resNodes)serverResNodes=mapData.resNodes;
   }
-  updateRoomUI(players,team,ih);
+  updateRoomUI(players,team,ih,numPlayers||2);
   showScreen('screen-room');
 });
 
-socket.on('lobbyUpdate',({players})=>{
+socket.on('lobbyUpdate',({players,numPlayers})=>{
   const me=players.find(p=>p.id===myId||p.socketId===myId);
   if(me) myTeam=Number(me.team);
-  updateRoomUI(players,myTeam,isHost);
+  updateRoomUI(players,myTeam,isHost,numPlayers||2);
 });
 
-function updateRoomUI(players,team,ih){
+function updateRoomUI(players,team,ih,numPlayers){
+  numPlayers=numPlayers||2;
   const list=document.getElementById('room-player-list');
   if(list)list.innerHTML=players.map(p=>{
     const t=Number(p.team);
-    const dot=`<div class="player-dot ${t===1?'pdot1':'pdot2'}"></div>`;
+    const tColor=TEAM_COLORS[t]||'#c8a050';
+    const dot=`<div class="player-dot" style="background:${tColor};width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:5px;"></div>`;
     const nameStyle='color:#c8a050;font-size:0.83rem;font-family:\'Cinzel\',serif;';
     const badge=p.isAI
       ?`<span style="font-size:0.68rem;padding:1px 5px;border-radius:3px;background:rgba(212,168,75,0.12);border:1px solid rgba(212,168,75,0.3);color:#a08040;margin-left:5px;">${p.difficulty}</span>`
       :'';
-    const teamColor=t===1?'#4a90d9':'#e05c44';
+    const tName=TEAM_NAMES[t]||`Team ${t}`;
     return `<div class="player-item">
       ${dot}
       <span style="${nameStyle}">${p.isAI?'🤖 ':''} ${p.name}${badge}</span>
-      <span style="margin-left:auto;font-size:0.75rem;color:${teamColor};">Team ${p.team}</span>
+      <span style="margin-left:auto;font-size:0.75rem;color:${tColor};">${TEAM_EMOJIS[t]||''} ${tName}</span>
     </div>`;
   }).join('');
 
-  const b1=document.getElementById('btn-team1'),b2=document.getElementById('btn-team2');
-  if(b1)b1.classList.toggle('active',Number(team)===1);
-  if(b2)b2.classList.toggle('active',Number(team)===2);
+  // Switch-team buttons — inject container if it doesn't exist
+  let switchRow=document.getElementById('team-switch-row');
+  if(!switchRow){
+    // Inject below the player list
+    const list2=document.getElementById('room-player-list');
+    if(list2){
+      switchRow=document.createElement('div');
+      switchRow.id='team-switch-row';
+      switchRow.style.cssText='display:flex;flex-wrap:wrap;gap:4px;margin:10px 0 4px;';
+      list2.parentNode.insertBefore(switchRow,list2.nextSibling);
+    }
+  }
+  if(switchRow){
+    switchRow.innerHTML='';
+    for(let t=1;t<=numPlayers;t++){
+      const tColor=TEAM_COLORS[t]||'#c8a050';
+      const active=Number(team)===t;
+      const btn=document.createElement('button');
+      btn.textContent=`${TEAM_EMOJIS[t]||''} ${TEAM_NAMES[t]||'Team '+t}`;
+      btn.style.cssText=`padding:5px 12px;margin:0 3px;font-family:'Cinzel',serif;font-size:0.7rem;border-radius:3px;cursor:pointer;border:1px solid ${tColor};color:${tColor};background:${active?'rgba('+hexToRGB(tColor)+',0.18)':'rgba(0,0,0,0.2)'};font-weight:${active?'bold':'normal'};letter-spacing:0.08em;`;
+      btn.onclick=()=>switchTeam(t);
+      switchRow.appendChild(btn);
+    }
+  }
+
   const bs=document.getElementById('btn-start');
   if(bs)bs.style.display=ih?'':'none';
 
   // ── AI controls (host only) ──────────────────────────────────────────────
-  // Inject or update a panel below the start button
   let aiCtrl=document.getElementById('ai-controls');
   if(ih){
     if(!aiCtrl){
@@ -1954,13 +2245,14 @@ function updateRoomUI(players,team,ih){
     const REM_STYLE='padding:4px 8px;background:rgba(160,40,40,0.15);border:1px solid rgba(160,40,40,0.4);border-radius:3px;color:#e05c44;font-family:\'Cinzel\',serif;font-size:0.68rem;cursor:pointer;';
     const LABEL='color:#6a4a18;font-size:0.7rem;font-family:\'Cinzel\',serif;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:7px;';
 
-    function aiRowFor(teamNum,teamLabel){
+    function aiRowFor(teamNum){
       const ai=players.find(p=>p.isAI&&Number(p.team)===teamNum);
       const human=players.find(p=>!p.isAI&&Number(p.team)===teamNum);
-      const color=teamNum===1?'#4a90d9':'#e05c44';
+      const tColor=TEAM_COLORS[teamNum]||'#c8a050';
+      const tLabel=`${TEAM_EMOJIS[teamNum]||''} ${TEAM_NAMES[teamNum]||'Team '+teamNum}`;
       let inner;
       if(human){
-        inner=`<span style="font-size:0.72rem;color:${color};opacity:0.5;">Human player on this team</span>`;
+        inner=`<span style="font-size:0.72rem;color:${tColor};opacity:0.5;">Human player</span>`;
       } else if(ai){
         inner=`<span style="color:#c8a050;font-size:0.75rem;">🤖 ${ai.difficulty.charAt(0).toUpperCase()+ai.difficulty.slice(1)} AI</span>`
              +`<button style="${REM_STYLE}margin-left:auto;" onclick="removeAI(${teamNum})">✕ Remove</button>`;
@@ -1969,17 +2261,23 @@ function updateRoomUI(players,team,ih){
              +`<button style="${BTN_STYLE}margin-left:6px;" onclick="addAI(${teamNum})">+ Add AI</button>`;
       }
       return `<div style="display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid rgba(107,79,16,0.15);">
-        <span style="color:${color};font-family:'Cinzel',serif;font-size:0.7rem;min-width:65px;">${teamLabel}</span>
+        <span style="color:${tColor};font-family:'Cinzel',serif;font-size:0.7rem;min-width:75px;">${tLabel}</span>
         ${inner}
       </div>`;
     }
 
-    aiCtrl.innerHTML=`<div style="${LABEL}">🤖 AI Players</div>`
-      +aiRowFor(1,'⚔ BLUE')
-      +aiRowFor(2,'🔥 RED');
+    let rows='<div style="'+LABEL+'">🤖 AI Players</div>';
+    for(let t=1;t<=numPlayers;t++) rows+=aiRowFor(t);
+    aiCtrl.innerHTML=rows;
   } else if(aiCtrl){
     aiCtrl.remove();
   }
+}
+
+// Helper: convert CSS hex colour string to "r,g,b" for rgba()
+function hexToRGB(hex){
+  const n=parseInt(hex.replace('#',''),16);
+  return `${(n>>16)&255},${(n>>8)&255},${n&255}`;
 }
 
 function addAI(teamNum){
@@ -1997,8 +2295,19 @@ socket.on('gameStarted',({units,buildings,teams,mapData,team})=>{
     const buf=Uint8Array.from(atob(mapData.heightsB64),c=>c.charCodeAt(0)).buffer;
     mapData.heights=Array.from(new Float32Array(buf));
   }
-  if(mapData){terrHeights=mapData.heights;P_OX=mapData.pox;P_OZ=mapData.poz;AI_OX=mapData.aox;AI_OZ=mapData.aoz;
-    if(mapData.resNodes)serverResNodes=mapData.resNodes;}
+  if(mapData){
+    terrHeights=mapData.heights;
+    if(mapData.mapSize){MAP=mapData.mapSize;HALF=MAP/2;}
+    if(mapData.spawnPositions){
+      allSpawns=mapData.spawnPositions;
+      P_OX=allSpawns[0]?.x||0; P_OZ=allSpawns[0]?.z||0;
+      AI_OX=allSpawns[1]?.x||0; AI_OZ=allSpawns[1]?.z||0;
+    } else if(mapData.pox!=null){
+      P_OX=mapData.pox;P_OZ=mapData.poz;AI_OX=mapData.aox;AI_OZ=mapData.aoz;
+      allSpawns=[{x:P_OX,z:P_OZ},{x:AI_OX,z:AI_OZ}];
+    }
+    if(mapData.resNodes)serverResNodes=mapData.resNodes;
+  }
   startGameClient();
 });
 
@@ -2028,10 +2337,15 @@ socket.on('gameOver',({winner})=>{
   const sub=document.getElementById('gameover-sub');
   if(winner===myTeam){
     if(title){title.textContent='VICTORY!';title.style.color='#f0d06a';}
-    if(sub)sub.textContent='Your team conquers the realm!';
+    if(sub)sub.textContent='Your empire conquers the realm!';
+  } else if(winner===0){
+    if(title){title.textContent='DRAW';title.style.color='#a0a0a0';}
+    if(sub)sub.textContent='The realm falls to ruin...';
   } else {
-    if(title){title.textContent='DEFEAT';title.style.color='#e05c44';}
-    if(sub)sub.textContent='Your empire has fallen...';
+    const wName=TEAM_NAMES[winner]||`Team ${winner}`;
+    const wColor=TEAM_COLORS[winner]||'#e05c44';
+    if(title){title.textContent='DEFEAT';title.style.color=wColor;}
+    if(sub)sub.textContent=`${TEAM_EMOJIS[winner]||'⚔'} ${wName} conquers the realm!`;
   }
   showScreen('screen-gameover');
   gameStarted=false;
@@ -2049,9 +2363,16 @@ function startGameClient(){
   showScreen('_none');
   const hud=document.getElementById('game-hud');if(hud)hud.style.display='';
 
+  // Recompute FOW_CELL and reset FOW state for this map size — must happen
+  // before buildTerrain() which calls initFOWPlane().
+  initFOW();
+
   // Team label
   const tl=document.getElementById('team-label');
-  if(tl){tl.textContent=myTeam===1?'⚔ TEAM BLUE':'🔥 TEAM RED';tl.style.color=myTeam===1?'#4a90d9':'#e05c44';}
+  const tColor=TEAM_COLORS[myTeam]||'#c8a050';
+  const tEmoji=TEAM_EMOJIS[myTeam]||'⚔';
+  const tName=TEAM_NAMES[myTeam]||`TEAM ${myTeam}`;
+  if(tl){tl.textContent=`${tEmoji} ${tName}`;tl.style.color=tColor;}
 
   mmC=document.getElementById('minimap');mmX=mmC.getContext('2d');
   buildTerrain();
@@ -2061,13 +2382,11 @@ function startGameClient(){
   // Spawn all initial meshes
   for(const id in serverBuildings)spawnBuildingMesh(serverBuildings[id]);
   for(const id in serverUnits)spawnUnitMesh(serverUnits[id]);
-  // Resource nodes will come in via gameState
 
-  const mySpawnX=myTeam===1?P_OX:AI_OX;
-  const mySpawnZ=myTeam===1?P_OZ:AI_OZ;
+  const mySpawn=allSpawns[myTeam-1]||{x:0,z:0};
+  const mySpawnX=mySpawn.x, mySpawnZ=mySpawn.z;
   fowReveal(mySpawnX,mySpawnZ,18);
 
-  // Log
   // Inject idle villager button into res-bar
   const resBar=document.getElementById('res-bar');
   if(resBar&&!document.getElementById('idle-vill-btn')){
@@ -2083,8 +2402,8 @@ function startGameClient(){
   }
   logEv('⚔ Your empire begins. Build and conquer!','good');
   logEv('🌫 Fog of war active. Explore to reveal.','warn');
-  logEv(`🎮 You are ${myTeam===1?'Team Blue':'Team Red'}`,'info');
-  if(tl){tl.textContent=myTeam===1?'⚔ TEAM BLUE':'🔥 TEAM RED';tl.style.color=myTeam===1?'#4a90d9':'#e05c44';}
+  logEv(`🎮 You are ${tEmoji} ${tName}`,'info');
+  if(tl){tl.textContent=`${tEmoji} ${tName}`;tl.style.color=tColor;}
 
   gameStarted=true;
   camTarget=new THREE.Vector3(mySpawnX,0,mySpawnZ);
