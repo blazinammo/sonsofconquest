@@ -21,6 +21,13 @@ const TEAM_HEX_ALT= {1:0x2a5a30, 2:0x5a2a20, 3:0x3a6020, 4:0x706010};
 // All spawn positions received from server — index = team-1
 let allSpawns = [{x:0,z:0},{x:0,z:0}];
 
+// Nav grid — Float32Array of [x,z, x,z, ...] land-only nodes received from server
+let navGrid = null;
+let _pathDebug = false;          // toggled by _path chat command
+let _pathDebugGroup = null;      // THREE.Group holding debug dot meshes
+let _raysDebug = false;          // toggled by _rays chat command
+let _raysGroup = null;           // THREE.Group holding per-unit path lines
+
 // ── Socket ────────────────────────────────────────────────────
 const socket = io();
 
@@ -101,7 +108,7 @@ const mmFowCtx = mmFowCanvas.getContext('2d');
 
 const BLDG_VISION = {
   'Town Center':16,'Tower':15,'Barracks':11,'House':8,
-  'Farm':8,'Blacksmith':9,'Lumbercamp':9,'MiningCamp':9,'Castle':19,'Market':11
+  'Farm':8,'Blacksmith':9,'Lumbercamp':9,'MiningCamp':14,'Castle':19,'Market':11
 };
 
 // ── Camera ────────────────────────────────────────────────────
@@ -155,6 +162,19 @@ function getHeight(wx,wz){
   return h00*(1-fx)*(1-fz)+h10*fx*(1-fz)+h01*(1-fx)*fz+h11*fx*fz;
 }
 function isWater(wx,wz){ return getHeight(wx,wz)<WATER_LEVEL; }
+// Returns true if there are enough forest trees near (wx,wz) to place a Mining Camp.
+// Mirrors the server-side check (>=3 inForest trees within MINE_R*1.5).
+function isOnForest(wx,wz){
+  const MINE_R=10;
+  let count=0;
+  for(const rn of serverResNodes){
+    if(rn.isTree&&rn.inForest&&!rn.depleted){
+      const dx=rn.x-wx,dz=rn.z-wz;
+      if(dx*dx+dz*dz<(MINE_R*1.5)*(MINE_R*1.5)){count++;if(count>=3)return true;}
+    }
+  }
+  return false;
+}
 
 // =================================================================
 //  FOW SYSTEM (exact port from reference)
@@ -258,6 +278,19 @@ function tickFOW(dt){
   fowTimer+=dt;
   if(fowTimer<0.15) return;
   fowTimer=0;
+
+  if(_fowDisabled){
+    // Fill entire FOW grid as fully visible, then fall through to the
+    // normal visibility pass below so all mesh types are shown correctly.
+    for(let i=0;i<fow.length;i++){fow[i]=2;fowVis[i]=1.0;}
+    updateFOWTexture();
+    for(const id in unitMeshes)    { if(unitMeshes[id])     unitMeshes[id].visible=true; }
+    for(const id in buildingMeshes){ if(buildingMeshes[id]) buildingMeshes[id].visible=true; }
+    for(const id in resNodeMeshes) { if(resNodeMeshes[id])  resNodeMeshes[id].visible=true; }
+    for(const obj of envObjects)   obj.mesh.visible=true;
+    return;
+  }
+
   for(let i=0;i<fow.length;i++){
     if(fow[i]===2){
       fow[i]=1;
@@ -648,11 +681,99 @@ function buildMesh_Lumbercamp(){
 }
 function buildMesh_MiningCamp(){
   const g=new THREE.Group();
-  const found=makePBRBox(3,0.2,2.5,0x8a8070,0.95);found.position.y=0.1;g.add(found);
-  const shed=makePBRBox(2.3,1.7,2,0x7a7060,0.85);shed.position.y=0.98;g.add(shed);
-  const rf=makePBRBox(2.5,0.15,2.2,0x5a5048,0.9);rf.position.y=1.9;g.add(rf);
-  const cart=makePBRBox(0.6,0.35,0.4,0x3a3028,0.9);cart.position.set(1.1,0.28,-0.9);g.add(cart);
-  for(let i=0;i<5;i++){const r=makePBRSphere(0.2+Math.random()*0.12,5,0x8a8070,0.9);r.scale.y=0.7;r.position.set(-0.8+(Math.random()-0.5)*0.5,0.15,-1+(Math.random()-0.5)*0.5);g.add(r);}
+
+  // ── Pit floor — large sunken oval of dark excavated earth ─────────────────
+  const pitFloor=makePBRBox(16,0.5,16,0x3a3028,0.97);
+  pitFloor.scale.set(1,1,1);pitFloor.position.y=-0.8;g.add(pitFloor);
+  // Inner darker pit centre
+  const pitInner=makePBRBox(10,0.55,10,0x2a2018,0.98);
+  pitInner.position.y=-1.2;g.add(pitInner);
+
+  // ── Terraced walls — stacked retaining ledges around the pit rim ──────────
+  const wallC=0x6a5e4a; // sandstone/earth wall colour
+  const ledgeC=0x7a7060;
+  for(let tier=0;tier<3;tier++){
+    const s=18-tier*2.5;   // outer footprint shrinks each tier
+    const h=0.7;
+    const y=-0.2+tier*h;
+    // Four sides: N/S walls then E/W walls
+    const wThick=1.2;
+    const ns=makePBRBox(s,h,wThick,tier%2===0?wallC:ledgeC,0.92);
+    const nsN=ns.clone();nsN.position.set(0,y, s/2-wThick/2);g.add(nsN);
+    const nsS=ns.clone();nsS.position.set(0,y,-s/2+wThick/2);g.add(nsS);
+    const ew=makePBRBox(wThick,h,s-wThick*2,tier%2===0?wallC:ledgeC,0.92);
+    const ewE=ew.clone();ewE.position.set( s/2-wThick/2,y,0);g.add(ewE);
+    const ewW=ew.clone();ewW.position.set(-s/2+wThick/2,y,0);g.add(ewW);
+  }
+
+  // ── Access ramps — two sloped ramps leading into the pit ─────────────────
+  for(const side of[-1,1]){
+    const ramp=makePBRBox(3.5,0.15,6,0x5a5040,0.95);
+    ramp.rotation.x=side*0.18;
+    ramp.position.set(side*6,0.05,0);g.add(ramp);
+  }
+
+  // ── Processing shed — workshop structure at one edge of the pit ───────────
+  const shedBase=makePBRBox(5,0.3,4,0x8a8070,0.9);shedBase.position.set(-7,0.35,-6);g.add(shedBase);
+  const shedWall=makePBRBox(4.5,2.8,3.5,0x6a6050,0.85);shedWall.position.set(-7,1.75,-6);g.add(shedWall);
+  const shedRoof=makePBRBox(5,0.2,4,0x3a3028,0.9);shedRoof.position.set(-7,3.2,-6);g.add(shedRoof);
+  // Chimney stack
+  const chimney=makePBRCyl(0.25,0.3,2.2,6,0x2a2820,0.9);chimney.position.set(-5.8,3.5,-5.5);g.add(chimney);
+  const smoke=makePBRCyl(0.3,0.15,0.5,6,0x1a1818,0.8);smoke.position.set(-5.8,4.8,-5.5);g.add(smoke);
+
+  // ── Equipment — ore carts on tracks ──────────────────────────────────────
+  for(let ci=0;ci<3;ci++){
+    const cart=new THREE.Group();
+    const body=makePBRBox(1.1,0.55,0.65,0x2a2820,0.85);body.position.y=0.35;cart.add(body);
+    // Cart wheels
+    for(const wx2 of[-0.4,0.4]) for(const wz2 of[-0.3,0.3]){
+      const whl=makePBRCyl(0.18,0.18,0.12,8,0x1a1818,0.7);
+      whl.rotation.z=Math.PI/2;whl.position.set(wx2,0.18,wz2);cart.add(whl);
+    }
+    // Ore load in cart — mixed rock pile
+    for(let ri=0;ri<4;ri++){
+      const ore=makePBRSphere(0.15+Math.random()*0.1,5,ci%2===0?0xd4a820:0x8a8880,0.7);
+      ore.position.set((Math.random()-0.5)*0.7,0.72,(Math.random()-0.5)*0.4);cart.add(ore);
+    }
+    cart.position.set(-3+ci*2.2, 0.0, -1.5+ci*0.4);
+    cart.rotation.y=Math.PI*0.08*ci;
+    g.add(cart);
+  }
+
+  // ── Track rails ───────────────────────────────────────────────────────────
+  for(const rz of[-0.28,0.28]){
+    const rail=makePBRBox(9,0.06,0.08,0x1a1818,0.6,0.6);
+    rail.position.set(-1.5,0.08,rz);g.add(rail);
+  }
+  // Rail ties
+  for(let ti=-4;ti<=4;ti++){
+    const tie=makePBRBox(0.7,0.06,0.8,0x3a2810,0.9);
+    tie.position.set(ti*1.0,0.05,0);g.add(tie);
+  }
+
+  // ── Perimeter fence — wooden posts with crossbars ─────────────────────────
+  const FENCE_R=9.5;
+  for(let fi=0;fi<20;fi++){
+    const ang=(fi/20)*Math.PI*2;
+    const fx=Math.cos(ang)*FENCE_R, fz=Math.sin(ang)*FENCE_R;
+    const post=makePBRCyl(0.1,0.1,1.4,5,0x5a3c18,0.9);
+    post.position.set(fx,0.7,fz);g.add(post);
+  }
+
+  // ── Excavated spoil heaps around the rim ─────────────────────────────────
+  const heapPositions=[[-8,5],[7,7],[-7,-7],[8,-4],[0,8]];
+  for(const[hx,hz] of heapPositions){
+    const heap=makePBRSphere(1.1+Math.random()*0.6,7,0x5a5040,0.96);
+    heap.scale.set(1+Math.random()*0.5,0.45+Math.random()*0.2,1+Math.random()*0.4);
+    heap.position.set(hx,0.25,hz);g.add(heap);
+  }
+
+  // ── Crane/pulley structure at pit edge ────────────────────────────────────
+  const craneBase=makePBRBox(0.5,0.5,0.5,0x4a4030,0.85);craneBase.position.set(6,0.25,3);g.add(craneBase);
+  const craneArm=makePBRBox(0.15,0.15,5,0x3a3020,0.85);craneArm.position.set(6,2.5,0.5);g.add(craneArm);
+  const craneMast=makePBRCyl(0.12,0.14,2.5,6,0x3a3020,0.85);craneMast.position.set(6,1.25,3);g.add(craneMast);
+  const cable=makePBRCyl(0.04,0.04,2.0,4,0x1a1818,0.5);cable.rotation.x=0.4;cable.position.set(6,1.8,1.6);g.add(cable);
+
   return g;
 }
 function buildMesh_Castle(team){
@@ -1072,7 +1193,11 @@ function setupMouse(){
       if(wp){
         ghostState.mesh.position.x=wp.x;ghostState.mesh.position.z=wp.z;
         ghostState.mesh.position.y=getHeight(wp.x,wp.z)+ghostState.size*0.5;
-        ghostState.mesh.material.color.set(isWater(wp.x,wp.z)?0xff3333:0x44ff88);
+        // Mining Camp requires a forest — show red if not on one
+        let invalid=isWater(wp.x,wp.z);
+        if(!invalid&&ghostState.type==='MiningCamp') invalid=!isOnForest(wp.x,wp.z);
+        ghostState.mesh.material.color.set(invalid?0xff3333:0x44ff88);
+        ghostState._invalid=invalid;
       }return;
     }
     if(!isDrag)return;
@@ -1447,6 +1572,9 @@ function syncGameState(state){
       if(delta.spd!==undefined) u.spd=delta.spd;
       if(delta.rng!==undefined) u.rng=delta.rng;
       if(delta.vision!==undefined) u.vision=delta.vision;
+      // Decode waypoints for _rays debug — wps is [[x,z],...] or null
+      if(delta.wps!==undefined) u._waypoints=delta.wps?delta.wps.map(([x,z])=>({x,z})):null;
+      if(delta.pd!==undefined) u._pathDest=delta.pd||null;
       // Rebuild mesh if unit just became armored
       if(!wasArmored&&u.armored&&unitMeshes[id]){
         const oldPos=unitMeshes[id].position.clone();
@@ -1662,7 +1790,7 @@ const UNIT_DEFS={
   Catapult: {hp:90,maxHp:90,atk:40,def:1,spd:0.016,rng:11.0,cost:{wood:200,gold:100},trainTime:20,pop:3,icon:'💣',vision:16},
   Scout:    {hp:55,maxHp:55,atk:5,def:1,spd:0.085,rng:1.2,cost:{food:80},trainTime:7,pop:1,icon:'🏇',vision:14},
 };
-const BUILD_COSTS={House:{wood:30},Barracks:{wood:175},Farm:{wood:60},Blacksmith:{wood:100,stone:50},Tower:{stone:125},MiningCamp:{wood:100},Lumbercamp:{wood:100},Castle:{stone:650},Market:{wood:175}};
+const BUILD_COSTS={House:{wood:30},Barracks:{wood:175},Farm:{wood:60},Blacksmith:{wood:100,stone:50},Tower:{stone:125},MiningCamp:{wood:800,stone:100},Lumbercamp:{wood:100},Castle:{stone:650},Market:{wood:175}};
 const TECHS=[
   {id:'Iron Tools',name:'Iron Tools',icon:'⚒',cost:{food:100,gold:50},desc:'Gatherers collect 40% faster',age:0},
   {id:'Town Watch',name:'Town Watch',icon:'👁',cost:{food:75},desc:'Towers +2 range',age:0},
@@ -1718,9 +1846,9 @@ function refreshSelUI(){
         addActBtn(panel,'🌾','Build Farm [F]',()=>tryBuild('Farm'),'F');
         addActBtn(panel,'⚒','Build Blacksmith',()=>tryBuild('Blacksmith'));
         addActBtn(panel,'🗼','Build Tower [T]',()=>tryBuild('Tower'),'T');
-        addActBtn(panel,'⛏','Mining Camp',()=>tryBuild('MiningCamp'));
-        addActBtn(panel,'🪵','Lumbercamp',()=>tryBuild('Lumbercamp'));
         if((myT.age||0)>=2)addActBtn(panel,'🏰','Build Castle [C]',()=>tryBuild('Castle'),'C');
+        if((myT.age||0)>=3)addActBtn(panel,'⛏','Mining Camp 👑',()=>tryBuild('MiningCamp'));
+        addActBtn(panel,'🪵','Lumbercamp',()=>tryBuild('Lumbercamp'));
         addActBtn(panel,'🏪','Build Market',()=>tryBuild('Market'));
       }
     }
@@ -1821,7 +1949,7 @@ function tryBuild(type){
   const t=serverTeams[myTeam]||{};
   if(cost.food&&t.food<cost.food||cost.wood&&t.wood<cost.wood||cost.gold&&t.gold<cost.gold||cost.stone&&t.stone<cost.stone){alert2('Not enough resources!',true);return;}
   cancelBuildMode();
-  const sizeMap={House:2.5,Barracks:3.5,Farm:3,Blacksmith:3,Tower:2,MiningCamp:2.5,Lumbercamp:2.5,Castle:5,Market:3};
+  const sizeMap={House:2.5,Barracks:3.5,Farm:3,Blacksmith:3,Tower:2,MiningCamp:20,Lumbercamp:2.5,Castle:5,Market:3};
   const size=sizeMap[type]||3;
   const ghostGeo=new THREE.BoxGeometry(size,2,size);
   const ghostMat=new THREE.MeshBasicMaterial({color:0x44ff88,transparent:true,opacity:0.35,depthWrite:false});
@@ -1910,6 +2038,9 @@ function handleSmithClick(e){
 function commitBuild(wx,wz){
   if(!ghostState)return;
   if(isWater(wx,wz)){alert2('Cannot build on water!',true);return;}
+  if(ghostState.type==='MiningCamp'&&!isOnForest(wx,wz)){
+    alert2('Mining Camp must be placed on a forest!',true);return;
+  }
   const{type,villId}=ghostState;
   socket.emit('cmd',{type:'build',buildType:type,x:wx,z:wz,villagerIds:[villId]});
   cancelBuildMode();
@@ -2063,10 +2194,173 @@ function onKeyDown(e){
 // =================================================================
 //  CHAT
 // =================================================================
+// Dev cheat: _isee disables fog of war entirely for the local client
+let _fowDisabled = false;
+
+function _revealAllFOW(){
+  for(let i=0;i<fow.length;i++){fow[i]=2;fowVis[i]=1.0;}
+  updateFOWTexture();
+  for(const id in unitMeshes)    { if(unitMeshes[id])     unitMeshes[id].visible=true; }
+  for(const id in buildingMeshes){ if(buildingMeshes[id]) buildingMeshes[id].visible=true; }
+  for(const id in resNodeMeshes) { if(resNodeMeshes[id])  resNodeMeshes[id].visible=true; }
+  for(const obj of envObjects)   obj.mesh.visible=true;
+}
+
+// _path debug: toggle nav grid node overlay
+function _togglePathDebug(){
+  _pathDebug=!_pathDebug;
+  if(_pathDebug){
+    if(_pathDebugGroup){scene.remove(_pathDebugGroup);_pathDebugGroup=null;}
+    if(!navGrid||navGrid.length===0){
+      logEv('⚠ No nav grid data yet — start a game first','warn');
+      _pathDebug=false; return;
+    }
+    _pathDebugGroup=new THREE.Group();
+    const count=navGrid.length/2;
+    const geo=new THREE.SphereGeometry(0.22,4,4);
+    const mat=new THREE.MeshBasicMaterial({color:0x00ffff});
+    const iMesh=new THREE.InstancedMesh(geo,mat,count);
+    const dummy=new THREE.Object3D();
+    for(let i=0;i<navGrid.length;i+=2){
+      const wx=navGrid[i],wz=navGrid[i+1];
+      dummy.position.set(wx,getHeight(wx,wz)+0.35,wz);
+      dummy.updateMatrix();
+      iMesh.setMatrixAt(i/2,dummy.matrix);
+    }
+    iMesh.instanceMatrix.needsUpdate=true;
+    _pathDebugGroup.add(iMesh);
+    scene.add(_pathDebugGroup);
+    logEv(`🔵 Nav grid: ${count} land nodes shown`,'info');
+  } else {
+    if(_pathDebugGroup){scene.remove(_pathDebugGroup);_pathDebugGroup=null;}
+    logEv('🔵 Nav grid hidden','info');
+  }
+}
+
+// _rays debug: draw the A* path each selected unit is currently following.
+// Rebuilt every frame so lines track the unit as it moves.
+// Layout of each unit's overlay:
+//   ● filled dot at current position (white)
+//   ── solid line: current position → tx/tz (immediate nav target, cyan)
+//   ╌╌ dashed segments (alternating) through remaining waypoints (yellow → orange)
+//   ★ star marker at _pathDest (final destination, red)
+function _toggleRaysDebug(){
+  _raysDebug=!_raysDebug;
+  if(!_raysDebug){
+    if(_raysGroup){scene.remove(_raysGroup);_raysGroup=null;}
+    logEv('🟡 Path rays hidden','info');
+  } else {
+    logEv('🟡 Path rays ON — select units to see their paths','info');
+  }
+}
+
+// Called every frame from the render loop when _raysDebug is active.
+// Tears down and rebuilds the line geometry for currently selected units.
+function _updateRaysDebug(){
+  if(!_raysDebug) return;
+  if(_raysGroup){scene.remove(_raysGroup);_raysGroup=null;}
+  if(!selectedUnitIds.length) return;
+
+  _raysGroup=new THREE.Group();
+
+  // Materials — reused across all units this frame
+  const matCurrent =new THREE.LineBasicMaterial({color:0x00ffff,linewidth:2,depthTest:false});
+  const matWaypoint=new THREE.LineBasicMaterial({color:0xffee00,linewidth:2,depthTest:false});
+  const matFinal   =new THREE.LineBasicMaterial({color:0xff4400,linewidth:2,depthTest:false});
+  const matDot     =new THREE.MeshBasicMaterial({color:0xffffff,depthTest:false});
+  const matDestDot =new THREE.MeshBasicMaterial({color:0xff4400,depthTest:false});
+  const dotGeo     =new THREE.SphereGeometry(0.18,6,6);
+  const destGeo    =new THREE.SphereGeometry(0.30,8,8);
+
+  const LIFT=0.5; // world units above terrain so lines don't clip into the ground
+
+  function terrY(wx,wz){ return getHeight(wx,wz)+LIFT; }
+
+  function addLine(points,mat){
+    if(points.length<2) return;
+    const geo=new THREE.BufferGeometry().setFromPoints(points);
+    _raysGroup.add(new THREE.Line(geo,mat));
+  }
+
+  for(const uid of selectedUnitIds){
+    const u=serverUnits[uid];
+    if(!u||u.dead) continue;
+
+    const ox=u.x, oz=u.z; // current server position
+
+    // ── 1. White dot at unit origin ───────────────────────────────────────────
+    const originDot=new THREE.Mesh(dotGeo,matDot);
+    originDot.position.set(ox,terrY(ox,oz),oz);
+    _raysGroup.add(originDot);
+
+    // ── 2. Cyan line: current position → tx/tz (the live nav step) ───────────
+    if(u.tx!=null&&u.tz!=null){
+      addLine([
+        new THREE.Vector3(ox,      terrY(ox,oz),      oz),
+        new THREE.Vector3(u.tx,    terrY(u.tx,u.tz),  u.tz),
+      ], matCurrent);
+    }
+
+    // ── 3. Yellow lines through remaining _waypoints ──────────────────────────
+    const wps=u._waypoints;
+    if(wps&&wps.length>0){
+      // Start the waypoint chain from tx/tz so it connects seamlessly
+      const chain=[];
+      const startX=u.tx!=null?u.tx:ox;
+      const startZ=u.tz!=null?u.tz:oz;
+      chain.push(new THREE.Vector3(startX, terrY(startX,startZ), startZ));
+      for(const wp of wps){
+        chain.push(new THREE.Vector3(wp.x, terrY(wp.x,wp.z), wp.z));
+      }
+      addLine(chain, matWaypoint);
+
+      // Small yellow dot at each intermediate waypoint
+      const wpDotMat=new THREE.MeshBasicMaterial({color:0xffee00,depthTest:false});
+      const wpDotGeo=new THREE.SphereGeometry(0.13,5,5);
+      for(const wp of wps){
+        const d=new THREE.Mesh(wpDotGeo,wpDotMat);
+        d.position.set(wp.x, terrY(wp.x,wp.z), wp.z);
+        _raysGroup.add(d);
+      }
+    }
+
+    // ── 4. Red line: last waypoint (or tx/tz) → _pathDest ─────────────────────
+    const pd=u._pathDest;
+    if(pd){
+      const lastWp=wps&&wps.length>0?wps[wps.length-1]:null;
+      const fromX=lastWp?lastWp.x:(u.tx!=null?u.tx:ox);
+      const fromZ=lastWp?lastWp.z:(u.tz!=null?u.tz:oz);
+      addLine([
+        new THREE.Vector3(fromX, terrY(fromX,fromZ), fromZ),
+        new THREE.Vector3(pd.x,  terrY(pd.x,pd.z),   pd.z),
+      ], matFinal);
+
+      // Red star (large sphere) at destination
+      const dd=new THREE.Mesh(destGeo,matDestDot);
+      dd.position.set(pd.x, terrY(pd.x,pd.z), pd.z);
+      _raysGroup.add(dd);
+    }
+  }
+
+  scene.add(_raysGroup);
+}
+
 function sendChat(){
   const inp=document.getElementById('chat-input');if(!inp)return;
   const text=inp.value.trim();if(!text)return;
-  socket.emit('chatMessage',{text});inp.value='';
+  inp.value='';
+  if(text==='_isee'){
+    _fowDisabled=!_fowDisabled;
+    // Notify server — it will send unfiltered data only while devMode is active.
+    // Without this, intercepting packets still gives the culled view everyone else gets.
+    socket.emit('devMode',{active:_fowDisabled});
+    if(_fowDisabled){_revealAllFOW();logEv('🔍 Dev: fog of war disabled','warn');}
+    else{fow.fill(0);fowVis.fill(0);logEv('🌫 Dev: fog of war re-enabled','warn');}
+    return;
+  }
+  if(text==='_path'){_togglePathDebug();return;}
+  if(text==='_rays'){_toggleRaysDebug();return;}
+  socket.emit('chatMessage',{text});
 }
 document.getElementById('chat-input')?.addEventListener('keydown',e=>{if(e.key==='Enter')sendChat();});
 
@@ -2090,9 +2384,7 @@ function refreshLobbies(){socket.emit('getLobbies');}
 function createLobby(){
   const inp=document.getElementById('lobby-name-input');
   const name=inp?.value.trim()||`${myName}'s Realm`;
-  const pcSel=document.getElementById('player-count-select');
-  const playerCount=pcSel?Number(pcSel.value):2;
-  socket.emit('createLobby',{lobbyName:name,playerCount});
+  socket.emit('createLobby',{lobbyName:name});
 }
 function joinByCode(){
   const inp=document.getElementById('join-id-input');
@@ -2122,19 +2414,6 @@ socket.on('connect',()=>{console.log('Connected');});
 socket.on('nameSet',({id})=>{
   myId=id;
   const nl=document.getElementById('lobby-player-name');if(nl)nl.textContent=myName;
-  // Inject player-count selector next to the create lobby button if not already present
-  if(!document.getElementById('player-count-select')){
-    const createBtn=document.querySelector('[onclick="createLobby()"]')||document.getElementById('btn-create-lobby');
-    if(createBtn){
-      const SEL_STYLE='background:rgba(20,12,3,0.9);border:1px solid #6b4f10;color:#f0d06a;font-family:\'Cinzel\',serif;font-size:0.72rem;padding:4px 7px;border-radius:3px;cursor:pointer;margin-right:6px;';
-      const wrap=document.createElement('span');
-      wrap.style.cssText='display:inline-flex;align-items:center;margin-right:6px;';
-      wrap.innerHTML=`<label style="color:#6a4a18;font-family:'Cinzel',serif;font-size:0.68rem;margin-right:4px;text-transform:uppercase;letter-spacing:0.1em;">Players</label>`
-        +`<select id="player-count-select" style="${SEL_STYLE}">`
-        +`<option value="2">2</option><option value="3">3</option><option value="4">4</option></select>`;
-      createBtn.parentNode.insertBefore(wrap,createBtn);
-    }
-  }
   socket.emit('getLobbies');
   showScreen('screen-lobby');
 });
@@ -2171,40 +2450,41 @@ socket.on('lobbyJoined',({lobbyId,team,isHost:ih,players,mapData,initialState,nu
     }
     if(initialState){serverUnits=initialState.units||{};serverBuildings=initialState.buildings||{};serverTeams=initialState.teams||{};}
     if(mapData.resNodes)serverResNodes=mapData.resNodes;
+    if(mapData.navGridB64){
+      const buf=Uint8Array.from(atob(mapData.navGridB64),c=>c.charCodeAt(0)).buffer;
+      navGrid=new Float32Array(buf);
+    }
   }
-  updateRoomUI(players,team,ih,numPlayers||2);
   showScreen('screen-room');
 });
 
 socket.on('lobbyUpdate',({players,numPlayers})=>{
   const me=players.find(p=>p.id===myId||p.socketId===myId);
   if(me) myTeam=Number(me.team);
-  updateRoomUI(players,myTeam,isHost,numPlayers||2);
+  updateRoomUI(players,myTeam,isHost,4);
 });
 
 function updateRoomUI(players,team,ih,numPlayers){
-  numPlayers=numPlayers||2;
+  // Always show 4 slots regardless of numPlayers
   const list=document.getElementById('room-player-list');
   if(list)list.innerHTML=players.map(p=>{
     const t=Number(p.team);
     const tColor=TEAM_COLORS[t]||'#c8a050';
-    const dot=`<div class="player-dot" style="background:${tColor};width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:5px;"></div>`;
+    const dot=`<div style="width:10px;height:10px;border-radius:50%;background:${tColor};display:inline-block;flex-shrink:0;"></div>`;
     const nameStyle='color:#c8a050;font-size:0.83rem;font-family:\'Cinzel\',serif;';
     const badge=p.isAI
       ?`<span style="font-size:0.68rem;padding:1px 5px;border-radius:3px;background:rgba(212,168,75,0.12);border:1px solid rgba(212,168,75,0.3);color:#a08040;margin-left:5px;">${p.difficulty}</span>`
       :'';
-    const tName=TEAM_NAMES[t]||`Team ${t}`;
-    return `<div class="player-item">
+    return `<div class="player-item" style="gap:8px;">
       ${dot}
       <span style="${nameStyle}">${p.isAI?'🤖 ':''} ${p.name}${badge}</span>
-      <span style="margin-left:auto;font-size:0.75rem;color:${tColor};">${TEAM_EMOJIS[t]||''} ${tName}</span>
+      <span style="margin-left:auto;font-size:0.75rem;color:${tColor};">${TEAM_EMOJIS[t]||''} ${TEAM_NAMES[t]||'Team '+t}</span>
     </div>`;
   }).join('');
 
-  // Switch-team buttons — inject container if it doesn't exist
+  // Always inject/rebuild the 4 team-slot switch row
   let switchRow=document.getElementById('team-switch-row');
   if(!switchRow){
-    // Inject below the player list
     const list2=document.getElementById('room-player-list');
     if(list2){
       switchRow=document.createElement('div');
@@ -2215,12 +2495,15 @@ function updateRoomUI(players,team,ih,numPlayers){
   }
   if(switchRow){
     switchRow.innerHTML='';
-    for(let t=1;t<=numPlayers;t++){
-      const tColor=TEAM_COLORS[t]||'#c8a050';
+    for(let t=1;t<=4;t++){
+      const tColor=TEAM_COLORS[t];
       const active=Number(team)===t;
       const btn=document.createElement('button');
-      btn.textContent=`${TEAM_EMOJIS[t]||''} ${TEAM_NAMES[t]||'Team '+t}`;
-      btn.style.cssText=`padding:5px 12px;margin:0 3px;font-family:'Cinzel',serif;font-size:0.7rem;border-radius:3px;cursor:pointer;border:1px solid ${tColor};color:${tColor};background:${active?'rgba('+hexToRGB(tColor)+',0.18)':'rgba(0,0,0,0.2)'};font-weight:${active?'bold':'normal'};letter-spacing:0.08em;`;
+      btn.textContent=`${TEAM_EMOJIS[t]} ${TEAM_NAMES[t]}`;
+      btn.style.cssText=`padding:5px 14px;font-family:'Cinzel',serif;font-size:0.7rem;border-radius:3px;cursor:pointer;`
+        +`border:1px solid ${tColor};color:${active?'#fff':tColor};`
+        +`background:${active?tColor+'88':'rgba(0,0,0,0.25)'};`
+        +`font-weight:${active?'bold':'normal'};letter-spacing:0.08em;transition:background 0.15s;`;
       btn.onclick=()=>switchTeam(t);
       switchRow.appendChild(btn);
     }
@@ -2229,7 +2512,7 @@ function updateRoomUI(players,team,ih,numPlayers){
   const bs=document.getElementById('btn-start');
   if(bs)bs.style.display=ih?'':'none';
 
-  // ── AI controls (host only) ──────────────────────────────────────────────
+  // ── AI controls (host only) — always 4 slots ──────────────────────────────
   let aiCtrl=document.getElementById('ai-controls');
   if(ih){
     if(!aiCtrl){
@@ -2243,41 +2526,37 @@ function updateRoomUI(players,team,ih,numPlayers){
     const SEL_STYLE='background:rgba(20,12,3,0.9);border:1px solid #6b4f10;color:#f0d06a;font-family:\'Cinzel\',serif;font-size:0.7rem;padding:3px 5px;border-radius:3px;cursor:pointer;';
     const BTN_STYLE='padding:4px 10px;background:rgba(212,168,75,0.08);border:1px solid rgba(107,79,16,0.5);border-radius:3px;color:#d4a84b;font-family:\'Cinzel\',serif;font-size:0.68rem;cursor:pointer;letter-spacing:0.08em;';
     const REM_STYLE='padding:4px 8px;background:rgba(160,40,40,0.15);border:1px solid rgba(160,40,40,0.4);border-radius:3px;color:#e05c44;font-family:\'Cinzel\',serif;font-size:0.68rem;cursor:pointer;';
-    const LABEL='color:#6a4a18;font-size:0.7rem;font-family:\'Cinzel\',serif;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:7px;';
+    const LABEL_STYLE='color:#6a4a18;font-size:0.7rem;font-family:\'Cinzel\',serif;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:7px;';
 
-    function aiRowFor(teamNum){
-      const ai=players.find(p=>p.isAI&&Number(p.team)===teamNum);
-      const human=players.find(p=>!p.isAI&&Number(p.team)===teamNum);
-      const tColor=TEAM_COLORS[teamNum]||'#c8a050';
-      const tLabel=`${TEAM_EMOJIS[teamNum]||''} ${TEAM_NAMES[teamNum]||'Team '+teamNum}`;
+    function aiRowFor(t){
+      const ai=players.find(pl=>pl.isAI&&Number(pl.team)===t);
+      const human=players.find(pl=>!pl.isAI&&Number(pl.team)===t);
+      const tColor=TEAM_COLORS[t];
+      const tLabel=`${TEAM_EMOJIS[t]} ${TEAM_NAMES[t]}`;
       let inner;
       if(human){
-        inner=`<span style="font-size:0.72rem;color:${tColor};opacity:0.5;">Human player</span>`;
+        inner=`<span style="font-size:0.72rem;color:${tColor};opacity:0.55;">Human player</span>`;
       } else if(ai){
         inner=`<span style="color:#c8a050;font-size:0.75rem;">🤖 ${ai.difficulty.charAt(0).toUpperCase()+ai.difficulty.slice(1)} AI</span>`
-             +`<button style="${REM_STYLE}margin-left:auto;" onclick="removeAI(${teamNum})">✕ Remove</button>`;
+             +`<button style="${REM_STYLE}margin-left:auto;" onclick="removeAI(${t})">✕</button>`;
       } else {
-        inner=`<select id="ai-diff-${teamNum}" style="${SEL_STYLE}">${DIFF_OPTS}</select>`
-             +`<button style="${BTN_STYLE}margin-left:6px;" onclick="addAI(${teamNum})">+ Add AI</button>`;
+        inner=`<select id="ai-diff-${t}" style="${SEL_STYLE}">${DIFF_OPTS}</select>`
+             +`<button style="${BTN_STYLE}margin-left:6px;" onclick="addAI(${t})">+ AI</button>`
+             +`<span style="margin-left:auto;font-size:0.65rem;color:#5a4020;font-style:italic;">empty — inactive</span>`;
       }
       return `<div style="display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid rgba(107,79,16,0.15);">
-        <span style="color:${tColor};font-family:'Cinzel',serif;font-size:0.7rem;min-width:75px;">${tLabel}</span>
+        <span style="color:${tColor};font-family:'Cinzel',serif;font-size:0.7rem;min-width:72px;">${tLabel}</span>
         ${inner}
       </div>`;
     }
 
-    let rows='<div style="'+LABEL+'">🤖 AI Players</div>';
-    for(let t=1;t<=numPlayers;t++) rows+=aiRowFor(t);
+    let rows=`<div style="${LABEL_STYLE}">⚔ Team Slots</div>`;
+    for(let t=1;t<=4;t++) rows+=aiRowFor(t);
+    rows+=`<div style="margin-top:8px;font-size:0.65rem;color:#4a3010;font-style:italic;">Empty slots become inactive bases on the map.</div>`;
     aiCtrl.innerHTML=rows;
   } else if(aiCtrl){
     aiCtrl.remove();
   }
-}
-
-// Helper: convert CSS hex colour string to "r,g,b" for rgba()
-function hexToRGB(hex){
-  const n=parseInt(hex.replace('#',''),16);
-  return `${(n>>16)&255},${(n>>8)&255},${n&255}`;
 }
 
 function addAI(teamNum){
@@ -2307,6 +2586,10 @@ socket.on('gameStarted',({units,buildings,teams,mapData,team})=>{
       allSpawns=[{x:P_OX,z:P_OZ},{x:AI_OX,z:AI_OZ}];
     }
     if(mapData.resNodes)serverResNodes=mapData.resNodes;
+    if(mapData.navGridB64){
+      const buf=Uint8Array.from(atob(mapData.navGridB64),c=>c.charCodeAt(0)).buffer;
+      navGrid=new Float32Array(buf);
+    }
   }
   startGameClient();
 });
@@ -2320,9 +2603,32 @@ socket.on('buildingPlaced',({building})=>{
   if(!buildingMeshes[building.id])spawnBuildingMesh(building);
 });
 
+socket.on('resNodesAdded',({nodes})=>{
+  // Full node objects spawned mid-game (e.g. Mining Camp deposits).
+  // The normal resNodesDelta only carries {id, amount} for pre-existing nodes,
+  // so new nodes must be delivered via this event with complete position/type data.
+  for(const rn of nodes){
+    if(!serverResNodes.find(r=>r.id===rn.id)) serverResNodes.push(rn);
+    if(!resNodeMeshes[rn.id]) makeResNodeMesh(rn);
+  }
+});
+
 socket.on('techResearched',({techId,team})=>{
   if(team===myTeam){logEv(`✓ ${techId} researched!`,'good');alert2(`✓ ${techId} complete!`);}
   else{logEv(`Enemy researched ${techId}!`,'warn');}
+});
+
+socket.on('playerDefeated',({team})=>{
+  const tName=(TEAM_NAMES[team]||`Team ${team}`);
+  const tEmoji=(TEAM_EMOJIS[team]||'⚔');
+  const tColor=(TEAM_COLORS[team]||'#e05c44');
+  if(team===myTeam){
+    logEv(`☠ Your empire has been defeated!`,'bad');
+    alert2(`☠ ${tEmoji} ${tName} — DEFEATED`);
+  } else {
+    logEv(`☠ ${tEmoji} ${tName} has been defeated!`,'good');
+    alert2(`☠ ${tEmoji} ${tName} has been defeated!`);
+  }
 });
 
 socket.on('chat',({name,text,team})=>{
@@ -2362,6 +2668,19 @@ socket.on('error',({message})=>{
 function startGameClient(){
   showScreen('_none');
   const hud=document.getElementById('game-hud');if(hud)hud.style.display='';
+
+  // ── Tear down any scene objects left over from a previous build ──────────
+  // This matters because the map is regenerated at game start (to pick the
+  // correct size), so the lobby preview terrain/water/env are now stale.
+  if(terrain){scene.remove(terrain);terrain=null;}
+  if(waterMesh){scene.remove(waterMesh);waterMesh=null;}
+  for(const obj of envObjects){scene.remove(obj.mesh);}
+  envObjects.length=0;
+  // Remove all unit, building, and resource node meshes
+  for(const id in unitMeshes){scene.remove(unitMeshes[id]);delete unitMeshes[id];}
+  for(const id in buildingMeshes){scene.remove(buildingMeshes[id]);delete buildingMeshes[id];}
+  for(const id in resNodeMeshes){scene.remove(resNodeMeshes[id]);delete resNodeMeshes[id];}
+  // ── End teardown ──────────────────────────────────────────────────────────
 
   // Recompute FOW_CELL and reset FOW state for this map size — must happen
   // before buildTerrain() which calls initFOWPlane().
@@ -2475,6 +2794,7 @@ function startRenderLoop(){
     tickParticles(dt);
     tickDayNight(gameTime);
     tickWater(gameTime);
+    if(_raysDebug) _updateRaysDebug();
 
     mmTimer+=dt;if(mmTimer>0.15){mmTimer=0;drawMinimap();}
     resTimer+=dt;if(resTimer>0.5){resTimer=0;updateResUI();updateIdleVillagerUI();}
